@@ -1,5 +1,6 @@
 use crate::handshake::{DefaultHandshakeEngine, HandshakeEngine, ResumePacket, SessionTicket};
 use crate::pipeline::{PipelineConfig, SankakuPipeline, VideoPayloadKind};
+use crate::transport::{SrtTransport, UdpTransport};
 use crate::{
     HandshakeContext, HandshakePacket, HandshakeRole, KeyExchange, PROTOCOL_VERSION, SessionKeys,
     ValidatedTicket, WirehairDecoder, WirehairEncoder,
@@ -10,7 +11,7 @@ use chacha20poly1305::{
     aead::{Aead, generic_array::GenericArray},
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::io::ErrorKind;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -28,18 +29,146 @@ const MAX_PROTECTED_BLOCK_SIZE: u32 = 512 * 1024;
 const MAX_WIRE_PACKET_SIZE: usize = 65_507;
 const TARGET_PACKET_SIZE: usize = 1150;
 const ADAPTIVE_PADDING_ALIGN: usize = 32;
-const GEOMETRY_HEADER_SIZE: usize = 23;
+const GEOMETRY_HEADER_SIZE: usize = 24;
 const DATA_PREFIX_SIZE: usize = 1 + 8 + GEOMETRY_HEADER_SIZE;
+const AUDIO_PREFIX_SIZE: usize = 1 + 8 + 4 + 8 + 1 + 4 + 4;
+const FEEDBACK_WINDOW: Duration = Duration::from_millis(500);
+const MIN_VIDEO_BITRATE_BPS: u32 = 500_000;
+const MAX_VIDEO_BITRATE_BPS: u32 = 8_000_000;
+const AIMD_INCREASE_STEP_BPS: u32 = 50_000;
+const AIMD_DECREASE_FACTOR: f32 = 0.80;
+const DEFAULT_VIDEO_BITRATE_BPS: u32 = 2_000_000;
 
-const TYPE_DATA: u8 = b'D';
-const TYPE_HANDSHAKE: u8 = b'H';
-const TYPE_RESUME: u8 = b'R';
-const TYPE_ACK: u8 = b'A';
-const TYPE_PING: u8 = b'P';
-const TYPE_PONG: u8 = b'O';
-const TYPE_FEC_FEEDBACK: u8 = b'F';
-const TYPE_STREAM_FIN: u8 = b'E';
-const TYPE_TELEMETRY: u8 = b'T';
+pub const VIDEO_CODEC_HEVC: u8 = 0x01;
+pub const VIDEO_CODEC_H264: u8 = 0x02;
+pub const AUDIO_CODEC_OPUS: u8 = 0x03;
+pub const AUDIO_CODEC_DEBUG_TEXT: u8 = 0x7E;
+
+fn is_supported_video_codec(codec: u8) -> bool {
+    matches!(codec, VIDEO_CODEC_HEVC | VIDEO_CODEC_H264)
+}
+
+fn is_supported_audio_codec(codec: u8) -> bool {
+    matches!(codec, AUDIO_CODEC_OPUS | AUDIO_CODEC_DEBUG_TEXT)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum StreamType {
+    Audio = 0x01,
+    Video = 0x02,
+    ScreenShare = 0x03,
+    Data = 0x04,
+}
+
+#[derive(Debug, Clone)]
+pub struct StreamContext<T> {
+    pub stream_type: StreamType,
+    pub state: T,
+}
+
+#[derive(Debug, Clone)]
+struct StreamRegistry<T> {
+    entries: HashMap<u32, StreamContext<T>>,
+}
+
+impl<T> Default for StreamRegistry<T> {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+}
+
+impl<T> StreamRegistry<T> {
+    fn get(&self, stream_id: &u32) -> Option<&T> {
+        self.entries.get(stream_id).map(|ctx| &ctx.state)
+    }
+
+    fn get_mut(&mut self, stream_id: &u32) -> Option<&mut T> {
+        self.entries.get_mut(stream_id).map(|ctx| &mut ctx.state)
+    }
+
+    fn insert(&mut self, stream_id: u32, stream_type: StreamType, state: T) -> Option<StreamContext<T>> {
+        self.entries.insert(stream_id, StreamContext { stream_type, state })
+    }
+
+    fn remove(&mut self, stream_id: &u32) -> Option<StreamContext<T>> {
+        self.entries.remove(stream_id)
+    }
+
+    fn ensure_with<F>(&mut self, stream_id: u32, stream_type: StreamType, build: F) -> Result<&mut T>
+    where
+        F: FnOnce() -> T,
+    {
+        match self.entries.entry(stream_id) {
+            Entry::Occupied(occupied) => {
+                let existing = occupied.into_mut();
+                if existing.stream_type != stream_type {
+                    bail!(
+                        "stream id {stream_id} is registered as {:?}, not {:?}",
+                        existing.stream_type,
+                        stream_type
+                    );
+                }
+                Ok(&mut existing.state)
+            }
+            Entry::Vacant(vacant) => {
+                let inserted = vacant.insert(StreamContext {
+                    stream_type,
+                    state: build(),
+                });
+                Ok(&mut inserted.state)
+            }
+        }
+    }
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PacketType {
+    Data = b'D',
+    Audio = 0x05,
+    Handshake = b'H',
+    Resume = b'R',
+    Ack = b'A',
+    Ping = b'P',
+    Pong = b'O',
+    FecFeedback = b'F',
+    StreamFin = b'E',
+    Telemetry = b'T',
+    Feedback = b'B',
+}
+
+impl PacketType {
+    fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            b'D' => Some(Self::Data),
+            0x05 => Some(Self::Audio),
+            b'H' => Some(Self::Handshake),
+            b'R' => Some(Self::Resume),
+            b'A' => Some(Self::Ack),
+            b'P' => Some(Self::Ping),
+            b'O' => Some(Self::Pong),
+            b'F' => Some(Self::FecFeedback),
+            b'E' => Some(Self::StreamFin),
+            b'T' => Some(Self::Telemetry),
+            b'B' => Some(Self::Feedback),
+            _ => None,
+        }
+    }
+}
+
+const TYPE_DATA: u8 = PacketType::Data as u8;
+const TYPE_AUDIO: u8 = PacketType::Audio as u8;
+const TYPE_HANDSHAKE: u8 = PacketType::Handshake as u8;
+const TYPE_RESUME: u8 = PacketType::Resume as u8;
+const TYPE_ACK: u8 = PacketType::Ack as u8;
+const TYPE_PONG: u8 = PacketType::Pong as u8;
+const TYPE_FEC_FEEDBACK: u8 = PacketType::FecFeedback as u8;
+const TYPE_STREAM_FIN: u8 = PacketType::StreamFin as u8;
+const TYPE_TELEMETRY: u8 = PacketType::Telemetry as u8;
+const TYPE_FEEDBACK: u8 = PacketType::Feedback as u8;
 
 /// Stable error taxonomy surfaced by stream APIs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,15 +292,21 @@ impl Default for TransportConfig {
 pub struct VideoFrame {
     pub timestamp_us: u64,
     pub keyframe: bool,
+    pub codec: u8,
     pub kind: VideoPayloadKind,
     pub payload: Vec<u8>,
 }
 
 impl VideoFrame {
     pub fn nal(payload: Vec<u8>, timestamp_us: u64, keyframe: bool) -> Self {
+        Self::nal_with_codec(payload, timestamp_us, keyframe, VIDEO_CODEC_HEVC)
+    }
+
+    pub fn nal_with_codec(payload: Vec<u8>, timestamp_us: u64, keyframe: bool, codec: u8) -> Self {
         Self {
             timestamp_us,
             keyframe,
+            codec,
             kind: VideoPayloadKind::NalUnit,
             payload,
         }
@@ -181,6 +316,7 @@ impl VideoFrame {
         Self {
             timestamp_us,
             keyframe: false,
+            codec: VIDEO_CODEC_HEVC,
             kind: VideoPayloadKind::SaoParameters,
             payload,
         }
@@ -195,7 +331,20 @@ pub struct InboundVideoFrame {
     pub frame_index: u64,
     pub timestamp_us: u64,
     pub keyframe: bool,
+    pub codec: u8,
+    pub packet_loss_ratio: f32,
     pub kind: VideoPayloadKind,
+    pub payload: Vec<u8>,
+}
+
+/// Inbound audio data emitted by the receiver.
+#[derive(Debug, Clone)]
+pub struct InboundAudioFrame {
+    pub session_id: u64,
+    pub stream_id: u32,
+    pub timestamp_us: u64,
+    pub codec: u8,
+    pub frames_per_packet: u32,
     pub payload: Vec<u8>,
 }
 
@@ -225,6 +374,13 @@ struct TelemetryPacket {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+struct FeedbackPacket {
+    session_id: u64,
+    stream_id: u32,
+    loss_ratio: f32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 struct StreamFinPacket {
     session_id: u64,
     stream_id: u32,
@@ -248,21 +404,12 @@ pub fn parse_psk_hex(input: &str) -> Result<[u8; 32]> {
     Ok(out)
 }
 
-fn load_psk_from_env() -> Result<[u8; 32]> {
-    let raw = std::env::var("SANKAKU_PSK")
-        .or_else(|_| std::env::var("KYU2_PSK"))
-        .context("Missing SANKAKU_PSK (or KYU2_PSK) 64-char hex key")?;
-    parse_psk_hex(&raw)
-}
-
-fn load_ticket_key_from_env_or_psk(psk: [u8; 32]) -> Result<[u8; 32]> {
-    let raw = std::env::var("SANKAKU_TICKET_KEY")
-        .or_else(|_| std::env::var("KYU2_TICKET_KEY"))
-        .ok();
-    if let Some(raw) = raw {
-        return parse_psk_hex(&raw);
+fn random_ticket_key() -> [u8; 32] {
+    let mut key = rand::random::<[u8; 32]>();
+    if key == [0u8; 32] {
+        key[0] = 1;
     }
-    Ok(psk)
+    key
 }
 
 fn unix_now_secs() -> u64 {
@@ -280,6 +427,11 @@ fn parse_u64_le(bytes: &[u8]) -> Option<u64> {
 fn parse_u16_le(bytes: &[u8]) -> Option<u16> {
     let array: [u8; 2] = bytes.try_into().ok()?;
     Some(u16::from_le_bytes(array))
+}
+
+fn parse_u32_le(bytes: &[u8]) -> Option<u32> {
+    let array: [u8; 4] = bytes.try_into().ok()?;
+    Some(u32::from_le_bytes(array))
 }
 
 fn parse_header_u32(header: &[u8; GEOMETRY_HEADER_SIZE], start: usize) -> u32 {
@@ -368,6 +520,23 @@ fn adjust_redundancy_with_telemetry(
         }
     };
     adjust_redundancy(current, &synthetic, policy)
+}
+
+fn clamp_video_bitrate(bitrate_bps: u32) -> u32 {
+    bitrate_bps.clamp(MIN_VIDEO_BITRATE_BPS, MAX_VIDEO_BITRATE_BPS)
+}
+
+fn apply_aimd_bitrate(current_bitrate_bps: u32, loss_ratio: f32) -> u32 {
+    if loss_ratio > 0.02 {
+        let decreased = ((current_bitrate_bps as f32) * AIMD_DECREASE_FACTOR).round() as u32;
+        return clamp_video_bitrate(decreased);
+    }
+
+    if loss_ratio <= f32::EPSILON {
+        return clamp_video_bitrate(current_bitrate_bps.saturating_add(AIMD_INCREASE_STEP_BPS));
+    }
+
+    clamp_video_bitrate(current_bitrate_bps)
 }
 
 /// Generates a dynamic mask for the geometry header.
@@ -462,8 +631,7 @@ struct SenderStreamState {
 }
 
 pub struct SankakuSender {
-    socket: UdpSocket,
-    psk: [u8; 32],
+    socket: Box<dyn SrtTransport>,
     transport: TransportConfig,
     handshake_engine: Arc<dyn HandshakeEngine>,
     resumption_ticket: Option<SessionTicket>,
@@ -473,28 +641,20 @@ pub struct SankakuSender {
     compression_graph: Vec<u8>,
     bootstrap_mode: SessionBootstrapMode,
     next_stream_id: u32,
-    streams: HashMap<u32, SenderStreamState>,
+    streams: StreamRegistry<SenderStreamState>,
     pacer: Pacer,
+    target_bitrate_bps: u32,
+    pending_bitrate_update_bps: Option<u32>,
 }
 
 impl SankakuSender {
     pub async fn new(dest: &str) -> Result<Self> {
-        let psk = load_psk_from_env()?;
-        Self::new_with_psk(dest, psk).await
+        Self::new_with_ticket(dest, None).await
     }
 
-    pub async fn new_with_psk(dest: &str, psk: [u8; 32]) -> Result<Self> {
-        Self::new_with_psk_and_ticket(dest, psk, None).await
-    }
-
-    pub async fn new_with_psk_and_ticket(
-        dest: &str,
-        psk: [u8; 32],
-        ticket: Option<SessionTicket>,
-    ) -> Result<Self> {
-        Self::new_with_psk_ticket_config_and_engine(
+    pub async fn new_with_ticket(dest: &str, ticket: Option<SessionTicket>) -> Result<Self> {
+        Self::new_with_ticket_config_and_engine(
             dest,
-            psk,
             ticket,
             TransportConfig::default(),
             Arc::new(DefaultHandshakeEngine),
@@ -502,14 +662,9 @@ impl SankakuSender {
         .await
     }
 
-    pub async fn new_with_psk_and_config(
-        dest: &str,
-        psk: [u8; 32],
-        config: TransportConfig,
-    ) -> Result<Self> {
-        Self::new_with_psk_ticket_config_and_engine(
+    pub async fn new_with_config(dest: &str, config: TransportConfig) -> Result<Self> {
+        Self::new_with_ticket_config_and_engine(
             dest,
-            psk,
             None,
             config,
             Arc::new(DefaultHandshakeEngine),
@@ -517,9 +672,8 @@ impl SankakuSender {
         .await
     }
 
-    pub async fn new_with_psk_ticket_config_and_engine(
+    pub async fn new_with_ticket_config_and_engine(
         dest: &str,
-        psk: [u8; 32],
         ticket: Option<SessionTicket>,
         config: TransportConfig,
         handshake_engine: Arc<dyn HandshakeEngine>,
@@ -528,11 +682,25 @@ impl SankakuSender {
 
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
         socket.connect(dest).await?;
+        Self::new_with_connected_transport_config_and_engine(
+            Box::new(UdpTransport::new(socket)),
+            ticket,
+            config,
+            handshake_engine,
+        )
+    }
+
+    pub fn new_with_connected_transport_config_and_engine(
+        socket: Box<dyn SrtTransport>,
+        ticket: Option<SessionTicket>,
+        config: TransportConfig,
+        handshake_engine: Arc<dyn HandshakeEngine>,
+    ) -> Result<Self> {
+        crate::init();
         let seed = rand::random::<u32>().max(1);
 
         Ok(Self {
             socket,
-            psk,
             transport: config,
             handshake_engine,
             resumption_ticket: ticket,
@@ -542,9 +710,49 @@ impl SankakuSender {
             compression_graph: Vec::new(),
             bootstrap_mode: SessionBootstrapMode::Unknown,
             next_stream_id: seed,
-            streams: HashMap::new(),
+            streams: StreamRegistry::default(),
             pacer: Pacer::new(config.max_bytes_per_sec),
+            target_bitrate_bps: clamp_video_bitrate(DEFAULT_VIDEO_BITRATE_BPS),
+            pending_bitrate_update_bps: None,
         })
+    }
+
+    // Compatibility constructor while callers migrate away from PSK wiring.
+    pub async fn new_with_psk(dest: &str, psk: [u8; 32]) -> Result<Self> {
+        let _ = psk;
+        Self::new(dest).await
+    }
+
+    // Compatibility constructor while callers migrate away from PSK wiring.
+    pub async fn new_with_psk_and_ticket(
+        dest: &str,
+        psk: [u8; 32],
+        ticket: Option<SessionTicket>,
+    ) -> Result<Self> {
+        let _ = psk;
+        Self::new_with_ticket(dest, ticket).await
+    }
+
+    // Compatibility constructor while callers migrate away from PSK wiring.
+    pub async fn new_with_psk_and_config(
+        dest: &str,
+        psk: [u8; 32],
+        config: TransportConfig,
+    ) -> Result<Self> {
+        let _ = psk;
+        Self::new_with_config(dest, config).await
+    }
+
+    // Compatibility constructor while callers migrate away from PSK wiring.
+    pub async fn new_with_psk_ticket_config_and_engine(
+        dest: &str,
+        psk: [u8; 32],
+        ticket: Option<SessionTicket>,
+        config: TransportConfig,
+        handshake_engine: Arc<dyn HandshakeEngine>,
+    ) -> Result<Self> {
+        let _ = psk;
+        Self::new_with_ticket_config_and_engine(dest, ticket, config, handshake_engine).await
     }
 
     pub fn set_transport_config(&mut self, config: TransportConfig) {
@@ -584,6 +792,14 @@ impl SankakuSender {
         self.streams.get(&stream_id).map(|state| state.redundancy)
     }
 
+    pub fn target_bitrate_bps(&self) -> u32 {
+        self.target_bitrate_bps
+    }
+
+    pub fn take_bitrate_update_bps(&mut self) -> Option<u32> {
+        self.pending_bitrate_update_bps.take()
+    }
+
     pub fn update_compression_graph(&mut self, serialized_graph: &[u8]) -> Result<()> {
         self.compression_graph.clear();
         self.compression_graph.extend_from_slice(serialized_graph);
@@ -616,6 +832,10 @@ impl SankakuSender {
     }
 
     pub fn open_stream(&mut self) -> Result<u32> {
+        self.open_stream_with_type(StreamType::Video)
+    }
+
+    pub fn open_stream_with_type(&mut self, stream_type: StreamType) -> Result<u32> {
         let stream_id = self.next_stream_id;
         self.next_stream_id = self
             .next_stream_id
@@ -623,6 +843,7 @@ impl SankakuSender {
             .context("Stream id space exhausted for this sender session")?;
         self.streams.insert(
             stream_id,
+            stream_type,
             SenderStreamState {
                 next_frame_index: 0,
                 redundancy: self.transport.initial_redundancy.clamp(1.0, MAX_REDUNDANCY),
@@ -636,18 +857,16 @@ impl SankakuSender {
 
     pub async fn send_frame(&mut self, stream_id: u32, frame: VideoFrame) -> Result<u64> {
         self.ensure_handshake().await?;
-        if !self.streams.contains_key(&stream_id) {
-            self.streams.insert(
-                stream_id,
-                SenderStreamState {
-                    next_frame_index: 0,
-                    redundancy: self.transport.initial_redundancy.clamp(1.0, MAX_REDUNDANCY),
-                    jitter_us: 0,
-                    bytes_sent: 0,
-                    frames_sent: 0,
-                },
-            );
+        if !is_supported_video_codec(frame.codec) {
+            bail!("unsupported video codec id {}", frame.codec);
         }
+        let _ = self.streams.ensure_with(stream_id, StreamType::Video, || SenderStreamState {
+            next_frame_index: 0,
+            redundancy: self.transport.initial_redundancy.clamp(1.0, MAX_REDUNDANCY),
+            jitter_us: 0,
+            bytes_sent: 0,
+            frames_sent: 0,
+        })?;
 
         let frame_index = self
             .streams
@@ -685,6 +904,7 @@ impl SankakuSender {
         self.send_chunk(
             tx_context,
             &raw,
+            frame.codec,
             frame.kind,
             frame_index,
             frame.keyframe,
@@ -702,6 +922,47 @@ impl SankakuSender {
         }
 
         Ok(frame_index)
+    }
+
+    pub async fn send_audio_frame(
+        &mut self,
+        stream_id: u32,
+        timestamp_us: u64,
+        codec: u8,
+        frames_per_packet: u32,
+        payload: Vec<u8>,
+    ) -> Result<()> {
+        if payload.is_empty() {
+            return Ok(());
+        }
+        if !is_supported_audio_codec(codec) {
+            bail!("unsupported audio codec 0x{codec:02X}");
+        }
+
+        self.ensure_handshake().await?;
+        let _ = self.streams.ensure_with(stream_id, StreamType::Audio, || SenderStreamState {
+            next_frame_index: 0,
+            redundancy: self.transport.initial_redundancy.clamp(1.0, MAX_REDUNDANCY),
+            jitter_us: 0,
+            bytes_sent: 0,
+            frames_sent: 0,
+        })?;
+        let session_id = self
+            .session_id
+            .context("Sender missing session id after handshake")?;
+        let payload_len = u32::try_from(payload.len()).context("audio payload too large")?;
+
+        let mut packet = Vec::with_capacity(AUDIO_PREFIX_SIZE + payload.len());
+        packet.push(TYPE_AUDIO);
+        packet.extend_from_slice(&session_id.to_le_bytes());
+        packet.extend_from_slice(&stream_id.to_le_bytes());
+        packet.extend_from_slice(&timestamp_us.to_le_bytes());
+        packet.push(codec);
+        packet.extend_from_slice(&frames_per_packet.to_le_bytes());
+        packet.extend_from_slice(&payload_len.to_le_bytes());
+        packet.extend_from_slice(&payload);
+        self.socket.send(&packet).await?;
+        Ok(())
     }
 
     pub async fn send_stream_fin(
@@ -764,7 +1025,7 @@ impl SankakuSender {
 
         let hello = self
             .handshake_engine
-            .build_client_hello(session_id, my_public, &self.psk);
+            .build_client_hello(session_id, my_public);
         let mut packet = vec![TYPE_HANDSHAKE];
         packet.extend(bincode::serialize(&hello)?);
 
@@ -791,7 +1052,7 @@ impl SankakuSender {
             }
             if !self
                 .handshake_engine
-                .verify_server_hello(&server_hello, &self.psk, my_public)
+                .verify_server_hello(&server_hello, my_public)
             {
                 continue;
             }
@@ -800,13 +1061,13 @@ impl SankakuSender {
             let context = HandshakeContext {
                 protocol_version: server_hello.protocol_version,
                 capabilities: server_hello.capabilities,
+                cipher_suite: server_hello.cipher_suite,
                 session_id,
                 client_public: my_public,
                 server_public: server_hello.public_key,
             };
             let keys = self.handshake_engine.derive_session_keys(
                 shared_secret,
-                &self.psk,
                 HandshakeRole::Client,
                 &context,
             )?;
@@ -848,6 +1109,7 @@ impl SankakuSender {
         &mut self,
         context: TxPacketContext,
         data: &[u8],
+        codec: u8,
         kind: VideoPayloadKind,
         frame_index: u64,
         keyframe: bool,
@@ -899,6 +1161,7 @@ impl SankakuSender {
             plain_header[16..20].copy_from_slice(&total_size.to_le_bytes());
             plain_header[20..22].copy_from_slice(&(pkt_size as u16).to_le_bytes());
             plain_header[22] = kind.as_header_flag();
+            plain_header[23] = codec;
 
             let mask = generate_header_mask(&context.header_key, &packet_data);
             for index in 0..GEOMETRY_HEADER_SIZE {
@@ -926,7 +1189,7 @@ impl SankakuSender {
     }
 
     async fn drain_control(
-        &self,
+        &mut self,
         session_id: u64,
         stream_id: u32,
         frame_index: u64,
@@ -936,8 +1199,22 @@ impl SankakuSender {
         let mut control_buf = [0u8; 512];
         loop {
             match self.socket.try_recv(&mut control_buf) {
-                Ok(amt) if amt >= 1 => match control_buf[0] {
-                    TYPE_FEC_FEEDBACK => {
+                Ok(amt) if amt >= 1 => match PacketType::from_byte(control_buf[0]) {
+                    Some(PacketType::Feedback) => {
+                        if let Ok(feedback) =
+                            bincode::deserialize::<FeedbackPacket>(&control_buf[1..amt])
+                            && feedback.session_id == session_id
+                            && feedback.stream_id == stream_id
+                        {
+                            let next_bitrate =
+                                apply_aimd_bitrate(self.target_bitrate_bps, feedback.loss_ratio);
+                            if next_bitrate != self.target_bitrate_bps {
+                                self.target_bitrate_bps = next_bitrate;
+                                self.pending_bitrate_update_bps = Some(next_bitrate);
+                            }
+                        }
+                    }
+                    Some(PacketType::FecFeedback) => {
                         if let Ok(feedback) =
                             bincode::deserialize::<FecFeedbackPacket>(&control_buf[1..amt])
                             && feedback.session_id == session_id
@@ -948,7 +1225,7 @@ impl SankakuSender {
                                 adjust_redundancy(*redundancy, &feedback, self.transport.fec);
                         }
                     }
-                    TYPE_TELEMETRY => {
+                    Some(PacketType::Telemetry) => {
                         if let Ok(telemetry) =
                             bincode::deserialize::<TelemetryPacket>(&control_buf[1..amt])
                             && telemetry.session_id == session_id
@@ -963,7 +1240,7 @@ impl SankakuSender {
                             *jitter_us = telemetry.jitter_us;
                         }
                     }
-                    TYPE_ACK => {}
+                    Some(PacketType::Ack) => {}
                     _ => {}
                 },
                 Ok(_) => break,
@@ -983,6 +1260,52 @@ struct DecoderState {
 }
 
 #[derive(Default)]
+struct FrameSequenceWindow {
+    max_seq_id: u32,
+    seen_seq_ids: HashSet<u32>,
+}
+
+#[derive(Default)]
+struct LossFeedbackWindow {
+    started_at: Option<Instant>,
+    frames: HashMap<u64, FrameSequenceWindow>,
+}
+
+impl LossFeedbackWindow {
+    fn observe_packet(&mut self, at: Instant, frame_index: u64, seq_id: u32) {
+        self.started_at.get_or_insert(at);
+        let frame = self.frames.entry(frame_index).or_default();
+        frame.max_seq_id = frame.max_seq_id.max(seq_id);
+        frame.seen_seq_ids.insert(seq_id);
+    }
+
+    fn maybe_flush_loss_ratio(&mut self, at: Instant) -> Option<f32> {
+        let started_at = self.started_at?;
+        if at.duration_since(started_at) < FEEDBACK_WINDOW {
+            return None;
+        }
+
+        let mut expected_packets = 0u64;
+        let mut received_packets = 0u64;
+        for frame in self.frames.values() {
+            expected_packets = expected_packets.saturating_add(frame.max_seq_id as u64 + 1);
+            received_packets =
+                received_packets.saturating_add(u64::try_from(frame.seen_seq_ids.len()).ok()?);
+        }
+
+        self.started_at = Some(at);
+        self.frames.clear();
+
+        if expected_packets == 0 {
+            return Some(0.0);
+        }
+
+        let lost_packets = expected_packets.saturating_sub(received_packets);
+        Some((lost_packets as f32 / expected_packets as f32).clamp(0.0, 1.0))
+    }
+}
+
+#[derive(Default)]
 struct StreamState {
     next_frame_index: u64,
     decoder_state: Option<DecoderState>,
@@ -991,13 +1314,15 @@ struct StreamState {
     last_arrival: Option<Instant>,
     last_timestamp_us: Option<u64>,
     jitter_us: u32,
+    loss_window: LossFeedbackWindow,
+    packet_loss_ratio: f32,
 }
 
 struct SessionState {
     source_ip: IpAddr,
     keys: SessionKeys,
     pipeline: SankakuPipeline,
-    streams: HashMap<u32, StreamState>,
+    streams: StreamRegistry<StreamState>,
 }
 
 #[derive(Default)]
@@ -1006,32 +1331,21 @@ struct ReceiverRuntime {
 }
 
 pub struct SankakuReceiver {
-    socket: UdpSocket,
-    psk: [u8; 32],
+    socket: Box<dyn SrtTransport>,
     ticket_key: [u8; 32],
     transport: TransportConfig,
     handshake_engine: Arc<dyn HandshakeEngine>,
+    compression_graph: Vec<u8>,
 }
 
 impl SankakuReceiver {
     pub async fn new(bind_addr: &str) -> Result<Self> {
-        let psk = load_psk_from_env()?;
-        let ticket_key = load_ticket_key_from_env_or_psk(psk)?;
-        Self::new_with_psk_and_ticket_key(bind_addr, psk, ticket_key).await
+        Self::new_with_ticket_key(bind_addr, random_ticket_key()).await
     }
 
-    pub async fn new_with_psk(bind_addr: &str, psk: [u8; 32]) -> Result<Self> {
-        Self::new_with_psk_and_ticket_key(bind_addr, psk, psk).await
-    }
-
-    pub async fn new_with_psk_and_ticket_key(
-        bind_addr: &str,
-        psk: [u8; 32],
-        ticket_key: [u8; 32],
-    ) -> Result<Self> {
-        Self::new_with_psk_ticket_key_config_and_engine(
+    pub async fn new_with_ticket_key(bind_addr: &str, ticket_key: [u8; 32]) -> Result<Self> {
+        Self::new_with_ticket_key_config_and_engine(
             bind_addr,
-            psk,
             ticket_key,
             TransportConfig::default(),
             Arc::new(DefaultHandshakeEngine),
@@ -1039,15 +1353,13 @@ impl SankakuReceiver {
         .await
     }
 
-    pub async fn new_with_psk_ticket_key_and_config(
+    pub async fn new_with_ticket_key_and_config(
         bind_addr: &str,
-        psk: [u8; 32],
         ticket_key: [u8; 32],
         config: TransportConfig,
     ) -> Result<Self> {
-        Self::new_with_psk_ticket_key_config_and_engine(
+        Self::new_with_ticket_key_config_and_engine(
             bind_addr,
-            psk,
             ticket_key,
             config,
             Arc::new(DefaultHandshakeEngine),
@@ -1055,6 +1367,66 @@ impl SankakuReceiver {
         .await
     }
 
+    pub async fn new_with_ticket_key_config_and_engine(
+        bind_addr: &str,
+        ticket_key: [u8; 32],
+        config: TransportConfig,
+        handshake_engine: Arc<dyn HandshakeEngine>,
+    ) -> Result<Self> {
+        crate::init();
+        let socket = UdpSocket::bind(bind_addr).await?;
+        Self::new_with_transport_ticket_key_config_and_engine(
+            Box::new(UdpTransport::new(socket)),
+            ticket_key,
+            config,
+            handshake_engine,
+        )
+    }
+
+    pub fn new_with_transport_ticket_key_config_and_engine(
+        socket: Box<dyn SrtTransport>,
+        ticket_key: [u8; 32],
+        config: TransportConfig,
+        handshake_engine: Arc<dyn HandshakeEngine>,
+    ) -> Result<Self> {
+        crate::init();
+        Ok(Self {
+            socket,
+            ticket_key,
+            transport: config,
+            handshake_engine,
+            compression_graph: Vec::new(),
+        })
+    }
+
+    // Compatibility constructor while callers migrate away from PSK wiring.
+    pub async fn new_with_psk(bind_addr: &str, psk: [u8; 32]) -> Result<Self> {
+        let _ = psk;
+        Self::new(bind_addr).await
+    }
+
+    // Compatibility constructor while callers migrate away from PSK wiring.
+    pub async fn new_with_psk_and_ticket_key(
+        bind_addr: &str,
+        psk: [u8; 32],
+        ticket_key: [u8; 32],
+    ) -> Result<Self> {
+        let _ = psk;
+        Self::new_with_ticket_key(bind_addr, ticket_key).await
+    }
+
+    // Compatibility constructor while callers migrate away from PSK wiring.
+    pub async fn new_with_psk_ticket_key_and_config(
+        bind_addr: &str,
+        psk: [u8; 32],
+        ticket_key: [u8; 32],
+        config: TransportConfig,
+    ) -> Result<Self> {
+        let _ = psk;
+        Self::new_with_ticket_key_and_config(bind_addr, ticket_key, config).await
+    }
+
+    // Compatibility constructor while callers migrate away from PSK wiring.
     pub async fn new_with_psk_ticket_key_config_and_engine(
         bind_addr: &str,
         psk: [u8; 32],
@@ -1062,23 +1434,31 @@ impl SankakuReceiver {
         config: TransportConfig,
         handshake_engine: Arc<dyn HandshakeEngine>,
     ) -> Result<Self> {
-        crate::init();
-        let socket = UdpSocket::bind(bind_addr).await?;
-        Ok(Self {
-            socket,
-            psk,
-            ticket_key,
-            transport: config,
-            handshake_engine,
-        })
+        let _ = psk;
+        Self::new_with_ticket_key_config_and_engine(bind_addr, ticket_key, config, handshake_engine)
+            .await
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr> {
         Ok(self.socket.local_addr()?)
     }
 
+    pub fn update_compression_graph(&mut self, serialized_graph: &[u8]) -> Result<()> {
+        self.compression_graph.clear();
+        self.compression_graph.extend_from_slice(serialized_graph);
+        Ok(())
+    }
+
+    fn build_receiver_pipeline(&self, payload_key: &[u8; 32]) -> Result<SankakuPipeline> {
+        let mut pipeline = SankakuPipeline::new_with_config(payload_key, self.transport.pipeline);
+        if !self.compression_graph.is_empty() {
+            pipeline.update_compression_graph(&self.compression_graph)?;
+        }
+        Ok(pipeline)
+    }
+
     pub fn spawn_frame_channel(self) -> mpsc::Receiver<InboundVideoFrame> {
-        let (tx, rx) = mpsc::channel(2048);
+        let (frame_tx, frame_rx) = mpsc::channel(2048);
         thread::spawn(move || {
             let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1087,13 +1467,45 @@ impl SankakuReceiver {
                 return;
             };
             runtime.block_on(async move {
-                let _ = self.run_frame_loop(tx).await;
+                let _ = self.run_media_loop(frame_tx, None).await;
             });
         });
-        rx
+        frame_rx
+    }
+
+    pub fn spawn_media_channels(
+        self,
+    ) -> (
+        mpsc::Receiver<InboundVideoFrame>,
+        mpsc::Receiver<InboundAudioFrame>,
+    ) {
+        let (frame_tx, frame_rx) = mpsc::channel(2048);
+        let (audio_tx, audio_rx) = mpsc::channel(2048);
+
+        thread::spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            runtime.block_on(async move {
+                let _ = self.run_media_loop(frame_tx, Some(audio_tx)).await;
+            });
+        });
+
+        (frame_rx, audio_rx)
     }
 
     pub async fn run_frame_loop(self, frame_tx: mpsc::Sender<InboundVideoFrame>) -> Result<()> {
+        self.run_media_loop(frame_tx, None).await
+    }
+
+    pub async fn run_media_loop(
+        self,
+        frame_tx: mpsc::Sender<InboundVideoFrame>,
+        audio_tx: Option<mpsc::Sender<InboundAudioFrame>>,
+    ) -> Result<()> {
         let mut runtime = ReceiverRuntime::default();
         let mut buf = vec![0u8; MAX_WIRE_PACKET_SIZE];
 
@@ -1103,23 +1515,27 @@ impl SankakuReceiver {
                 continue;
             }
             let packet = &buf[..amt];
-            match packet[0] {
-                TYPE_HANDSHAKE => {
+            match PacketType::from_byte(packet[0]) {
+                Some(PacketType::Handshake) => {
                     self.handle_handshake_packet(&mut runtime, packet, src)
                         .await?;
                 }
-                TYPE_RESUME => {
+                Some(PacketType::Resume) => {
                     self.handle_resume_packet(&mut runtime, packet, src).await?;
                 }
-                TYPE_PING => {
+                Some(PacketType::Ping) => {
                     self.handle_ping_packet(&mut runtime, packet, src).await?;
                 }
-                TYPE_STREAM_FIN => {
+                Some(PacketType::StreamFin) => {
                     self.handle_stream_fin_packet(&mut runtime, packet, src)
                         .await?;
                 }
-                TYPE_DATA => {
+                Some(PacketType::Data) => {
                     self.handle_data_packet(&mut runtime, packet, src, &frame_tx)
+                        .await?;
+                }
+                Some(PacketType::Audio) => {
+                    self.handle_audio_packet(&mut runtime, packet, src, audio_tx.as_ref())
                         .await?;
                 }
                 _ => {}
@@ -1136,10 +1552,7 @@ impl SankakuReceiver {
         let Ok(client_hello) = bincode::deserialize::<HandshakePacket>(&packet[1..]) else {
             return Ok(());
         };
-        if !self
-            .handshake_engine
-            .verify_client_hello(&client_hello, &self.psk)
-        {
+        if !self.handshake_engine.verify_client_hello(&client_hello) {
             return Ok(());
         }
 
@@ -1153,7 +1566,6 @@ impl SankakuReceiver {
             client_hello.session_id,
             server_public,
             client_hello.public_key,
-            &self.psk,
             session_ticket,
         );
 
@@ -1165,13 +1577,13 @@ impl SankakuReceiver {
         let context = HandshakeContext {
             protocol_version: PROTOCOL_VERSION,
             capabilities: client_hello.capabilities,
+            cipher_suite: client_hello.cipher_suite,
             session_id: client_hello.session_id,
             client_public: client_hello.public_key,
             server_public,
         };
         let session_keys = self.handshake_engine.derive_session_keys(
             shared_secret,
-            &self.psk,
             HandshakeRole::Server,
             &context,
         )?;
@@ -1180,11 +1592,8 @@ impl SankakuReceiver {
             SessionState {
                 source_ip: src.ip(),
                 keys: session_keys,
-                pipeline: SankakuPipeline::new_with_config(
-                    &session_keys.payload_rx,
-                    self.transport.pipeline,
-                ),
-                streams: HashMap::new(),
+                pipeline: self.build_receiver_pipeline(&session_keys.payload_rx)?,
+                streams: StreamRegistry::default(),
             },
         );
         Ok(())
@@ -1252,11 +1661,8 @@ impl SankakuReceiver {
             SessionState {
                 source_ip: src.ip(),
                 keys: session_keys,
-                pipeline: SankakuPipeline::new_with_config(
-                    &session_keys.payload_rx,
-                    self.transport.pipeline,
-                ),
-                streams: HashMap::new(),
+                pipeline: self.build_receiver_pipeline(&session_keys.payload_rx)?,
+                streams: StreamRegistry::default(),
             },
         );
         Ok(())
@@ -1309,6 +1715,75 @@ impl SankakuReceiver {
         Ok(())
     }
 
+    async fn handle_audio_packet(
+        &self,
+        runtime: &mut ReceiverRuntime,
+        packet: &[u8],
+        src: SocketAddr,
+        audio_tx: Option<&mpsc::Sender<InboundAudioFrame>>,
+    ) -> Result<()> {
+        if packet.len() < AUDIO_PREFIX_SIZE {
+            return Ok(());
+        }
+
+        let Some(session_id) = packet.get(1..9).and_then(parse_u64_le) else {
+            return Ok(());
+        };
+        let Some(stream_id) = packet.get(9..13).and_then(parse_u32_le) else {
+            return Ok(());
+        };
+        let Some(timestamp_us) = packet.get(13..21).and_then(parse_u64_le) else {
+            return Ok(());
+        };
+        let Some(codec) = packet.get(21).copied() else {
+            return Ok(());
+        };
+        if !is_supported_audio_codec(codec) {
+            return Ok(());
+        }
+        let Some(frames_per_packet) = packet.get(22..26).and_then(parse_u32_le) else {
+            return Ok(());
+        };
+        let Some(payload_len_u32) = packet.get(26..30).and_then(parse_u32_le) else {
+            return Ok(());
+        };
+        let payload_len = usize::try_from(payload_len_u32).unwrap_or(0);
+        if payload_len == 0 {
+            return Ok(());
+        }
+
+        let payload_start = AUDIO_PREFIX_SIZE;
+        let payload_end = payload_start.saturating_add(payload_len);
+        if payload_end > packet.len() {
+            return Ok(());
+        }
+
+        let Some(session) = runtime.sessions.get_mut(&session_id) else {
+            return Ok(());
+        };
+        if session.source_ip != src.ip() {
+            return Ok(());
+        }
+
+        let _ = session
+            .streams
+            .ensure_with(stream_id, StreamType::Audio, StreamState::default);
+
+        if let Some(audio_tx) = audio_tx {
+            let frame = InboundAudioFrame {
+                session_id,
+                stream_id,
+                timestamp_us,
+                codec,
+                frames_per_packet,
+                payload: packet[payload_start..payload_end].to_vec(),
+            };
+            let _ = audio_tx.send(frame).await;
+        }
+
+        Ok(())
+    }
+
     async fn handle_data_packet(
         &self,
         runtime: &mut ReceiverRuntime,
@@ -1354,6 +1829,7 @@ impl SankakuReceiver {
             return Ok(());
         };
         let kind_flag = plain_header[22];
+        let codec = plain_header[23];
 
         if total_size == 0 || total_size > MAX_PROTECTED_BLOCK_SIZE {
             return Ok(());
@@ -1362,6 +1838,9 @@ impl SankakuReceiver {
             return Ok(());
         }
         if VideoPayloadKind::from_header_flag(kind_flag).is_none() {
+            return Ok(());
+        }
+        if !is_supported_video_codec(codec) {
             return Ok(());
         }
 
@@ -1373,8 +1852,23 @@ impl SankakuReceiver {
 
         let stream = session
             .streams
-            .entry(stream_id)
-            .or_insert_with(StreamState::default);
+            .ensure_with(stream_id, StreamType::Video, StreamState::default)?;
+        let arrival_now = Instant::now();
+
+        stream
+            .loss_window
+            .observe_packet(arrival_now, frame_index, seq_id);
+        if let Some(loss_ratio) = stream.loss_window.maybe_flush_loss_ratio(arrival_now) {
+            stream.packet_loss_ratio = loss_ratio;
+            let feedback = FeedbackPacket {
+                session_id,
+                stream_id,
+                loss_ratio,
+            };
+            let mut feedback_wire = vec![TYPE_FEEDBACK];
+            feedback_wire.extend(bincode::serialize(&feedback)?);
+            self.socket.send_to(&feedback_wire, src).await?;
+        }
 
         if frame_index != stream.next_frame_index {
             return Ok(());
@@ -1432,16 +1926,15 @@ impl SankakuReceiver {
         let envelope: FrameEnvelope =
             bincode::deserialize(&raw).context("Failed to decode frame envelope")?;
 
-        let now = Instant::now();
         if let (Some(last_arrival), Some(last_timestamp)) =
             (stream.last_arrival, stream.last_timestamp_us)
         {
-            let arrival_delta = now.duration_since(last_arrival).as_micros() as i128;
+            let arrival_delta = arrival_now.duration_since(last_arrival).as_micros() as i128;
             let sender_delta = envelope.timestamp_us.saturating_sub(last_timestamp) as i128;
             let sample = (arrival_delta - sender_delta).unsigned_abs() as u64;
             stream.jitter_us = ((stream.jitter_us as u64 * 7 + sample) / 8) as u32;
         }
-        stream.last_arrival = Some(now);
+        stream.last_arrival = Some(arrival_now);
         stream.last_timestamp_us = Some(envelope.timestamp_us);
 
         stream.bytes_received = stream
@@ -1456,6 +1949,8 @@ impl SankakuReceiver {
             frame_index,
             timestamp_us: envelope.timestamp_us,
             keyframe: envelope.keyframe,
+            codec,
+            packet_loss_ratio: stream.packet_loss_ratio,
             kind: restored_kind,
             payload: envelope.payload,
         };
@@ -1506,15 +2001,9 @@ pub struct SankakuStream {
 }
 
 impl SankakuStream {
-    pub async fn connect(
-        target: &str,
-        bind_addr: &str,
-        psk: [u8; 32],
-        ticket_key: [u8; 32],
-    ) -> Result<Self> {
-        let mut sender = SankakuSender::new_with_psk(target, psk).await?;
-        let receiver =
-            SankakuReceiver::new_with_psk_and_ticket_key(bind_addr, psk, ticket_key).await?;
+    pub async fn connect(target: &str, bind_addr: &str) -> Result<Self> {
+        let mut sender = SankakuSender::new(target).await?;
+        let receiver = SankakuReceiver::new(bind_addr).await?;
         let inbound = receiver.spawn_frame_channel();
         let stream_id = sender.open_stream()?;
         Ok(Self {
@@ -1525,9 +2014,7 @@ impl SankakuStream {
     }
 
     pub async fn connect_with_env(target: &str, bind_addr: &str) -> Result<Self> {
-        let psk = load_psk_from_env()?;
-        let ticket_key = load_ticket_key_from_env_or_psk(psk)?;
-        Self::connect(target, bind_addr, psk, ticket_key).await
+        Self::connect(target, bind_addr).await
     }
 
     pub fn stream_id(&self) -> u32 {

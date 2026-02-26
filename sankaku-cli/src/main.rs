@@ -1,7 +1,12 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use sankaku_core::{parse_psk_hex, SankakuReceiver, SankakuSender, VideoFrame, VideoPayloadKind};
+use sankaku_core::{
+    extract_sao_parameters, nal_unit_type, parse_psk_hex, split_annex_b, SankakuReceiver,
+    SankakuSender, SaoParameters, VideoFrame, VideoPayloadKind,
+};
+use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Parser)]
@@ -43,6 +48,16 @@ enum Commands {
         #[arg(long, default_value_t = 0)]
         max_frames: u64,
     },
+    InspectHevc {
+        #[arg(long)]
+        file: String,
+    },
+    DumpSaoDataset {
+        #[arg(long)]
+        input: String,
+        #[arg(long)]
+        output: String,
+    },
 }
 
 fn resolve_psk(explicit: Option<String>) -> Result<[u8; 32]> {
@@ -76,6 +91,35 @@ fn unix_us_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_micros() as u64
+}
+
+fn hevc_nal_type_name(nal_type: u8) -> &'static str {
+    match nal_type {
+        0..=31 => "VCL",
+        32 => "VPS",
+        33 => "SPS",
+        34 => "PPS",
+        35 => "AUD",
+        36 => "EOS",
+        37 => "EOB",
+        38 => "FD",
+        39 => "PREFIX_SEI",
+        40 => "SUFFIX_SEI",
+        41..=47 => "RESERVED_NVCL",
+        48..=63 => "UNSPECIFIED",
+        _ => "UNKNOWN",
+    }
+}
+
+fn sao_as_bytes(sao: &SaoParameters) -> &[u8] {
+    // SAFETY: `SaoParameters` is `#[repr(C)]`, and we only create a read-only
+    // byte view over its initialized stack value for immediate file writing.
+    unsafe {
+        std::slice::from_raw_parts(
+            (sao as *const SaoParameters).cast::<u8>(),
+            std::mem::size_of::<SaoParameters>(),
+        )
+    }
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -170,6 +214,98 @@ async fn main() -> Result<()> {
                     break;
                 }
             }
+        }
+        Commands::InspectHevc { file } => {
+            let bytes =
+                fs::read(&file).with_context(|| format!("Failed to read HEVC file {file}"))?;
+
+            let mut nal_type_counts: HashMap<u8, usize> = HashMap::new();
+            let mut nal_count = 0usize;
+
+            for (index, nal_unit) in split_annex_b(&bytes).enumerate() {
+                nal_count = nal_count.saturating_add(1);
+
+                if let Some(unit_type) = nal_unit_type(nal_unit) {
+                    *nal_type_counts.entry(unit_type).or_insert(0) += 1;
+
+                    if index < 50 {
+                        println!(
+                            "[Index {index}] NAL Unit Type: {unit_type} ({}) - Length: {} bytes",
+                            hevc_nal_type_name(unit_type),
+                            nal_unit.len()
+                        );
+                    }
+
+                    if unit_type <= 31 {
+                        if let Some(sao) = extract_sao_parameters(nal_unit) {
+                            println!(
+                                "[Index {index}] VCL Unit - SAO Extracted: CTU({},{}), Type: {}, Band: {}, Offsets: [{}, {}, {}, {}]",
+                                sao.ctu_x,
+                                sao.ctu_y,
+                                sao.sao_type_idx,
+                                sao.band_position,
+                                sao.offset[0],
+                                sao.offset[1],
+                                sao.offset[2],
+                                sao.offset[3],
+                            );
+                        }
+                    }
+                } else if index < 50 {
+                    println!(
+                        "[Index {index}] NAL Unit Type: Unknown (MALFORMED) - Length: {} bytes",
+                        nal_unit.len()
+                    );
+                }
+            }
+
+            let mut sorted_counts: Vec<(u8, usize)> = nal_type_counts
+                .iter()
+                .map(|(ty, count)| (*ty, *count))
+                .collect();
+            sorted_counts.sort_by_key(|(ty, _)| *ty);
+
+            let vcl_count: usize = sorted_counts
+                .iter()
+                .filter(|(ty, _)| *ty <= 31)
+                .map(|(_, count)| *count)
+                .sum();
+
+            println!("\nHEVC NAL Summary");
+            println!("Total NAL units parsed: {nal_count}");
+            for (unit_type, count) in sorted_counts {
+                println!(
+                    "Type {:>2} ({:<13}) -> {}",
+                    unit_type,
+                    hevc_nal_type_name(unit_type),
+                    count
+                );
+            }
+            println!("Total VCL units (0-31): {vcl_count}");
+        }
+        Commands::DumpSaoDataset { input, output } => {
+            let bytes =
+                fs::read(&input).with_context(|| format!("Failed to read HEVC input {input}"))?;
+            let mut output_file = fs::File::create(&output)
+                .with_context(|| format!("Failed to create output dataset {output}"))?;
+
+            let mut structs_written = 0usize;
+            for nal_unit in split_annex_b(&bytes) {
+                if let Some(sao) = extract_sao_parameters(nal_unit) {
+                    output_file
+                        .write_all(sao_as_bytes(&sao))
+                        .with_context(|| format!("Failed to write dataset struct to {output}"))?;
+                    structs_written = structs_written.saturating_add(1);
+                }
+            }
+
+            output_file
+                .flush()
+                .with_context(|| format!("Failed to flush dataset output {output}"))?;
+
+            println!(
+                "Successfully wrote {structs_written} SaoParameters structs to dataset file: {output}"
+            );
         }
     }
     Ok(())

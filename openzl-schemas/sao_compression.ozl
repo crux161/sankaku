@@ -1,0 +1,12 @@
+SaoParameters = {
+  ctu_x: UInt16LE
+  ctu_y: UInt16LE
+  sao_type_idx: UInt8
+  band_position: UInt8
+  offset_0: Int8
+  offset_1: Int8
+  offset_2: Int8
+  offset_3: Int8
+}
+
+: SaoParameters[417]
