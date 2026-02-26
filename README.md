@@ -16,6 +16,24 @@ It preserves authenticated X25519/ChaCha20-Poly1305 session setup and Wirehair F
 cargo check --workspace
 ```
 
+## It's ALIVE 🧟‍♂️
+```bash
+../../../../openzl/zli train --profile sddl --profile-arg sao_compression.ozl ../sao_training.bin -o ../sao_graph.bin --force
+Picked 1 samples out of 1 samples with total size 4170
+Benchmarking untrained compressor...
+1 files: 4170 -> 1827 (2.28),  20.13 MB/s  58.46 MB/s
+Selected greedy trainer by default since no trainer was specified
+[==================================================] Calculating improvement by clustering tag 11/11
+[==================================================] Training ACE graph 1 / 4: ACE progress
+[==================================================] Training ACE graph 3 / 4: ACE progress
+[==================================================] Training ACE graph 4 / 4: ACE progress
+Benchmarking trained compressor...
+1 files: 4170 -> 1485 (2.81),  81.06 MB/s  283.59 MB/s
+Training improved compression ratio by 23.03%
+
+😆 yeah!
+```
+
 ## Quick Start
 
 Set a shared key:
