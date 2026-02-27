@@ -1,9 +1,5 @@
 use crate::openzl;
 use anyhow::{Context, Result, bail};
-use chacha20poly1305::{
-    ChaCha20Poly1305, Key, Nonce,
-    aead::{Aead, KeyInit, Payload},
-};
 
 const ENVELOPE_RAW_NAL: u8 = 0;
 const ENVELOPE_RAW_SAO: u8 = 1;
@@ -54,9 +50,8 @@ impl Default for PipelineConfig {
     }
 }
 
-/// Encrypt/decrypt + optional pre-encryption OpenZL stage.
+/// Optional OpenZL stage + lightweight envelope framing.
 pub struct SankakuPipeline {
-    cipher: ChaCha20Poly1305,
     config: PipelineConfig,
     openzl: openzl::OpenZlContext,
 }
@@ -68,16 +63,10 @@ impl SankakuPipeline {
     }
 
     /// Initialize with explicit pipeline behavior.
-    pub fn new_with_config(key_bytes: &[u8; 32], config: PipelineConfig) -> Self {
-        let key = Key::from_slice(key_bytes);
-        let cipher = ChaCha20Poly1305::new(key);
+    pub fn new_with_config(_key_bytes: &[u8; 32], config: PipelineConfig) -> Self {
         let openzl =
             openzl::OpenZlContext::new(&[]).expect("OpenZL context allocation should succeed");
-        Self {
-            cipher,
-            config,
-            openzl,
-        }
+        Self { config, openzl }
     }
 
     /// Updates the active serialized OpenZL compression graph without resetting session keys.
@@ -90,7 +79,7 @@ impl SankakuPipeline {
         self.openzl.graph()
     }
 
-    /// Applies optional OpenZL (for SAO) and seals with ChaCha20-Poly1305.
+    /// Applies optional OpenZL (for SAO) and wraps payload with an envelope marker.
     pub fn protect_frame(
         &mut self,
         raw_data: &[u8],
@@ -115,39 +104,22 @@ impl SankakuPipeline {
         plaintext.push(mode);
         plaintext.extend_from_slice(&body);
 
-        let nonce = Self::generate_nonce(stream_id, frame_index);
-        let aad = Self::generate_aad(stream_id, frame_index);
-        let payload = Payload {
-            msg: &plaintext,
-            aad: &aad,
-        };
-        let encrypted = self
-            .cipher
-            .encrypt(&nonce, payload)
-            .map_err(|_| anyhow::anyhow!("Encryption failed"))?;
-        Ok(encrypted)
+        let _ = (stream_id, frame_index);
+        Ok(plaintext)
     }
 
-    /// Opens an encrypted block and applies OpenZL decode when needed.
+    /// Opens an envelope block and applies OpenZL decode when needed.
     pub fn restore_frame(
         &self,
         protected_data: &[u8],
         stream_id: u32,
         frame_index: u64,
     ) -> Result<(VideoPayloadKind, Vec<u8>)> {
-        let nonce = Self::generate_nonce(stream_id, frame_index);
-        let aad = Self::generate_aad(stream_id, frame_index);
-        let payload = Payload {
-            msg: protected_data,
-            aad: &aad,
-        };
-        let plaintext = self
-            .cipher
-            .decrypt(&nonce, payload)
-            .map_err(|_| anyhow::anyhow!("Decryption failed (Auth Tag mismatch)"))?;
+        let _ = (stream_id, frame_index);
+        let plaintext = protected_data;
 
         let Some((&mode, body)) = plaintext.split_first() else {
-            bail!("Decryption produced empty block");
+            bail!("Protected block produced empty payload");
         };
 
         match mode {
@@ -182,20 +154,6 @@ impl SankakuPipeline {
     ) -> Result<Vec<u8>> {
         let (_kind, payload) = self.restore_frame(protected_data, stream_id, block_id)?;
         Ok(payload)
-    }
-
-    fn generate_nonce(stream_id: u32, block_id: u64) -> Nonce {
-        let mut nonce_bytes = [0u8; 12];
-        nonce_bytes[0..4].copy_from_slice(&stream_id.to_le_bytes());
-        nonce_bytes[4..12].copy_from_slice(&block_id.to_le_bytes());
-        *Nonce::from_slice(&nonce_bytes)
-    }
-
-    fn generate_aad(stream_id: u32, block_id: u64) -> [u8; 12] {
-        let mut aad = [0u8; 12];
-        aad[0..4].copy_from_slice(&stream_id.to_le_bytes());
-        aad[4..12].copy_from_slice(&block_id.to_le_bytes());
-        aad
     }
 }
 

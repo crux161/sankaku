@@ -1,30 +1,21 @@
-use crate::handshake::{DefaultHandshakeEngine, HandshakeEngine, ResumePacket, SessionTicket};
+use crate::handshake::{DefaultHandshakeEngine, HandshakeEngine, SessionTicket};
 use crate::pipeline::{PipelineConfig, SankakuPipeline, VideoPayloadKind};
-use crate::transport::{SrtTransport, UdpTransport};
-use crate::{
-    HandshakeContext, HandshakePacket, HandshakeRole, KeyExchange, PROTOCOL_VERSION, SessionKeys,
-    ValidatedTicket, WirehairDecoder, WirehairEncoder,
-};
+use crate::transport::{QuicTransport, SrtTransport};
+use crate::{WirehairDecoder, WirehairEncoder};
 use anyhow::{Context, Result, bail};
-use chacha20poly1305::{
-    ChaCha20Poly1305, KeyInit,
-    aead::{Aead, generic_array::GenericArray},
-};
+use bytes::Bytes;
+use quinn::{Connection, Endpoint};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, hash_map::Entry};
-use std::io::ErrorKind;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::net::UdpSocket;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tokio::time::{sleep, timeout};
+use tokio::sync::mpsc::error::TryRecvError;
+use tokio::time::sleep;
 
 const MAX_REDUNDANCY: f32 = 4.0;
-const HANDSHAKE_RETRIES: usize = 10;
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(500);
-const SESSION_TICKET_LIFETIME_SECS: u64 = 6 * 60 * 60;
 const MAX_PROTECTED_BLOCK_SIZE: u32 = 512 * 1024;
 const MAX_WIRE_PACKET_SIZE: usize = 65_507;
 const TARGET_PACKET_SIZE: usize = 1150;
@@ -38,6 +29,26 @@ const MAX_VIDEO_BITRATE_BPS: u32 = 8_000_000;
 const AIMD_INCREASE_STEP_BPS: u32 = 50_000;
 const AIMD_DECREASE_FACTOR: f32 = 0.80;
 const DEFAULT_VIDEO_BITRATE_BPS: u32 = 2_000_000;
+const TRANSPORT_PIPELINE_KEY: [u8; 32] = [0u8; 32];
+const QUIC_DATAGRAM_FALLBACK_MAX: usize = 1_200;
+
+/// Input handle for QUIC-native constructors.
+pub enum QuicHandle {
+    Endpoint(Endpoint),
+    Connection(Connection),
+}
+
+impl From<Endpoint> for QuicHandle {
+    fn from(endpoint: Endpoint) -> Self {
+        Self::Endpoint(endpoint)
+    }
+}
+
+impl From<Connection> for QuicHandle {
+    fn from(connection: Connection) -> Self {
+        Self::Connection(connection)
+    }
+}
 
 pub const VIDEO_CODEC_HEVC: u8 = 0x01;
 pub const VIDEO_CODEC_H264: u8 = 0x02;
@@ -89,15 +100,26 @@ impl<T> StreamRegistry<T> {
         self.entries.get_mut(stream_id).map(|ctx| &mut ctx.state)
     }
 
-    fn insert(&mut self, stream_id: u32, stream_type: StreamType, state: T) -> Option<StreamContext<T>> {
-        self.entries.insert(stream_id, StreamContext { stream_type, state })
+    fn insert(
+        &mut self,
+        stream_id: u32,
+        stream_type: StreamType,
+        state: T,
+    ) -> Option<StreamContext<T>> {
+        self.entries
+            .insert(stream_id, StreamContext { stream_type, state })
     }
 
     fn remove(&mut self, stream_id: &u32) -> Option<StreamContext<T>> {
         self.entries.remove(stream_id)
     }
 
-    fn ensure_with<F>(&mut self, stream_id: u32, stream_type: StreamType, build: F) -> Result<&mut T>
+    fn ensure_with<F>(
+        &mut self,
+        stream_id: u32,
+        stream_type: StreamType,
+        build: F,
+    ) -> Result<&mut T>
     where
         F: FnOnce() -> T,
     {
@@ -129,8 +151,6 @@ impl<T> StreamRegistry<T> {
 enum PacketType {
     Data = b'D',
     Audio = 0x05,
-    Handshake = b'H',
-    Resume = b'R',
     Ack = b'A',
     Ping = b'P',
     Pong = b'O',
@@ -145,8 +165,6 @@ impl PacketType {
         match byte {
             b'D' => Some(Self::Data),
             0x05 => Some(Self::Audio),
-            b'H' => Some(Self::Handshake),
-            b'R' => Some(Self::Resume),
             b'A' => Some(Self::Ack),
             b'P' => Some(Self::Ping),
             b'O' => Some(Self::Pong),
@@ -161,8 +179,6 @@ impl PacketType {
 
 const TYPE_DATA: u8 = PacketType::Data as u8;
 const TYPE_AUDIO: u8 = PacketType::Audio as u8;
-const TYPE_HANDSHAKE: u8 = PacketType::Handshake as u8;
-const TYPE_RESUME: u8 = PacketType::Resume as u8;
 const TYPE_ACK: u8 = PacketType::Ack as u8;
 const TYPE_PONG: u8 = PacketType::Pong as u8;
 const TYPE_FEC_FEEDBACK: u8 = PacketType::FecFeedback as u8;
@@ -194,6 +210,41 @@ impl KyuErrorCode {
             Self::Internal => "INTERNAL",
         }
     }
+
+    pub fn from_quic_connection_error(error: &quinn::ConnectionError) -> Self {
+        match error {
+            quinn::ConnectionError::VersionMismatch => Self::VersionMismatch,
+            quinn::ConnectionError::TransportError(_)
+            | quinn::ConnectionError::ConnectionClosed(_)
+            | quinn::ConnectionError::ApplicationClosed(_)
+            | quinn::ConnectionError::Reset
+            | quinn::ConnectionError::TimedOut
+            | quinn::ConnectionError::LocallyClosed
+            | quinn::ConnectionError::CidsExhausted => Self::Socket,
+        }
+    }
+
+    pub fn from_quic_read_error(error: &quinn::ReadError) -> Self {
+        match error {
+            quinn::ReadError::ConnectionLost(connection) => {
+                Self::from_quic_connection_error(connection)
+            }
+            quinn::ReadError::Reset(_)
+            | quinn::ReadError::IllegalOrderedRead
+            | quinn::ReadError::ClosedStream => Self::Socket,
+            quinn::ReadError::ZeroRttRejected => Self::PacketRejected,
+        }
+    }
+
+    pub fn from_quic_write_error(error: &quinn::WriteError) -> Self {
+        match error {
+            quinn::WriteError::ConnectionLost(connection) => {
+                Self::from_quic_connection_error(connection)
+            }
+            quinn::WriteError::Stopped(_) | quinn::WriteError::ClosedStream => Self::Socket,
+            quinn::WriteError::ZeroRttRejected => Self::PacketRejected,
+        }
+    }
 }
 
 /// Lightweight event stream for embeddings that need observability.
@@ -214,6 +265,42 @@ pub enum KyuEvent {
         session_id: Option<u64>,
         stream_id: Option<u32>,
     },
+}
+
+fn kyu_error_code_from_transport(error: &anyhow::Error) -> KyuErrorCode {
+    if let Some(connection) = error.downcast_ref::<quinn::ConnectionError>() {
+        return KyuErrorCode::from_quic_connection_error(connection);
+    }
+    if let Some(read) = error.downcast_ref::<quinn::ReadError>() {
+        return KyuErrorCode::from_quic_read_error(read);
+    }
+    if let Some(write) = error.downcast_ref::<quinn::WriteError>() {
+        return KyuErrorCode::from_quic_write_error(write);
+    }
+    KyuErrorCode::Socket
+}
+
+fn annotate_transport_error(context: &'static str, error: anyhow::Error) -> anyhow::Error {
+    let code = kyu_error_code_from_transport(&error);
+    error.context(format!("{context} [{}]", code.as_str()))
+}
+
+async fn resolve_quic_connection(
+    handle: impl Into<QuicHandle>,
+) -> Result<(Connection, Option<Endpoint>)> {
+    match handle.into() {
+        QuicHandle::Connection(connection) => Ok((connection, None)),
+        QuicHandle::Endpoint(endpoint) => {
+            let incoming = endpoint
+                .accept()
+                .await
+                .context("endpoint closed before receiving a QUIC connection")?;
+            let connection = incoming.await.map_err(|error| {
+                annotate_transport_error("failed to accept QUIC connection", error.into())
+            })?;
+            Ok((connection, Some(endpoint)))
+        }
+    }
 }
 
 /// Indicates how the current sender session keys were bootstrapped.
@@ -412,13 +499,6 @@ fn random_ticket_key() -> [u8; 32] {
     key
 }
 
-fn unix_now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 fn parse_u64_le(bytes: &[u8]) -> Option<u64> {
     let array: [u8; 8] = bytes.try_into().ok()?;
     Some(u64::from_le_bytes(array))
@@ -539,28 +619,6 @@ fn apply_aimd_bitrate(current_bitrate_bps: u32, loss_ratio: f32) -> u32 {
     clamp_video_bitrate(current_bitrate_bps)
 }
 
-/// Generates a dynamic mask for the geometry header.
-fn generate_header_mask(
-    header_key: &[u8; 32],
-    payload_sample: &[u8],
-) -> [u8; GEOMETRY_HEADER_SIZE] {
-    let key = GenericArray::from_slice(header_key);
-    let cipher = ChaCha20Poly1305::new(key);
-
-    let mut nonce_bytes = [0u8; 12];
-    let copy_len = payload_sample.len().min(12);
-    nonce_bytes[..copy_len].copy_from_slice(&payload_sample[..copy_len]);
-    let nonce = GenericArray::from_slice(&nonce_bytes);
-
-    if let Ok(encrypted) = cipher.encrypt(nonce, [0u8; GEOMETRY_HEADER_SIZE].as_ref()) {
-        let mut mask = [0u8; GEOMETRY_HEADER_SIZE];
-        mask.copy_from_slice(&encrypted[..GEOMETRY_HEADER_SIZE]);
-        return mask;
-    }
-
-    [0u8; GEOMETRY_HEADER_SIZE]
-}
-
 struct Pacer {
     target_bytes_per_sec: u64,
     max_burst_bytes: f64,
@@ -618,7 +676,6 @@ impl Pacer {
 struct TxPacketContext {
     session_id: u64,
     stream_id: u32,
-    header_key: [u8; 32],
 }
 
 #[derive(Debug, Clone)]
@@ -631,12 +688,11 @@ struct SenderStreamState {
 }
 
 pub struct SankakuSender {
-    socket: Box<dyn SrtTransport>,
+    socket: Arc<dyn SrtTransport>,
+    endpoint_guard: Option<Endpoint>,
     transport: TransportConfig,
-    handshake_engine: Arc<dyn HandshakeEngine>,
     resumption_ticket: Option<SessionTicket>,
     session_id: Option<u64>,
-    session_keys: Option<SessionKeys>,
     pipeline: Option<SankakuPipeline>,
     compression_graph: Vec<u8>,
     bootstrap_mode: SessionBootstrapMode,
@@ -645,16 +701,21 @@ pub struct SankakuSender {
     pacer: Pacer,
     target_bitrate_bps: u32,
     pending_bitrate_update_bps: Option<u32>,
+    control_out_tx: Option<mpsc::UnboundedSender<Bytes>>,
+    control_in_rx: Option<mpsc::UnboundedReceiver<Bytes>>,
 }
 
 impl SankakuSender {
-    pub async fn new(dest: &str) -> Result<Self> {
-        Self::new_with_ticket(dest, None).await
+    pub async fn new(handle: impl Into<QuicHandle>) -> Result<Self> {
+        Self::new_with_ticket(handle, None).await
     }
 
-    pub async fn new_with_ticket(dest: &str, ticket: Option<SessionTicket>) -> Result<Self> {
+    pub async fn new_with_ticket(
+        handle: impl Into<QuicHandle>,
+        ticket: Option<SessionTicket>,
+    ) -> Result<Self> {
         Self::new_with_ticket_config_and_engine(
-            dest,
+            handle,
             ticket,
             TransportConfig::default(),
             Arc::new(DefaultHandshakeEngine),
@@ -662,9 +723,12 @@ impl SankakuSender {
         .await
     }
 
-    pub async fn new_with_config(dest: &str, config: TransportConfig) -> Result<Self> {
+    pub async fn new_with_config(
+        handle: impl Into<QuicHandle>,
+        config: TransportConfig,
+    ) -> Result<Self> {
         Self::new_with_ticket_config_and_engine(
-            dest,
+            handle,
             None,
             config,
             Arc::new(DefaultHandshakeEngine),
@@ -673,39 +737,42 @@ impl SankakuSender {
     }
 
     pub async fn new_with_ticket_config_and_engine(
-        dest: &str,
+        handle: impl Into<QuicHandle>,
         ticket: Option<SessionTicket>,
         config: TransportConfig,
         handshake_engine: Arc<dyn HandshakeEngine>,
     ) -> Result<Self> {
         crate::init();
-
-        let socket = UdpSocket::bind("0.0.0.0:0").await?;
-        socket.connect(dest).await?;
-        Self::new_with_connected_transport_config_and_engine(
-            Box::new(UdpTransport::new(socket)),
+        let _ = handshake_engine;
+        let (connection, endpoint_guard) = resolve_quic_connection(handle).await?;
+        let socket: Box<dyn SrtTransport> = Box::new(QuicTransport::new(connection));
+        let mut sender = Self::new_with_connected_transport_config_and_engine(
+            socket,
             ticket,
             config,
-            handshake_engine,
-        )
+            Arc::new(DefaultHandshakeEngine),
+        )?;
+        sender.endpoint_guard = endpoint_guard;
+        Ok(sender)
     }
 
     pub fn new_with_connected_transport_config_and_engine(
         socket: Box<dyn SrtTransport>,
         ticket: Option<SessionTicket>,
         config: TransportConfig,
-        handshake_engine: Arc<dyn HandshakeEngine>,
+        _handshake_engine: Arc<dyn HandshakeEngine>,
     ) -> Result<Self> {
         crate::init();
+        let socket: Arc<dyn SrtTransport> = socket.into();
         let seed = rand::random::<u32>().max(1);
 
         Ok(Self {
             socket,
+            endpoint_guard: None,
             transport: config,
-            handshake_engine,
+            // Handshake is now provided by QUIC/TLS; keep constructor shape for compatibility.
             resumption_ticket: ticket,
             session_id: None,
-            session_keys: None,
             pipeline: None,
             compression_graph: Vec::new(),
             bootstrap_mode: SessionBootstrapMode::Unknown,
@@ -714,45 +781,54 @@ impl SankakuSender {
             pacer: Pacer::new(config.max_bytes_per_sec),
             target_bitrate_bps: clamp_video_bitrate(DEFAULT_VIDEO_BITRATE_BPS),
             pending_bitrate_update_bps: None,
+            control_out_tx: None,
+            control_in_rx: None,
         })
     }
 
     // Compatibility constructor while callers migrate away from PSK wiring.
-    pub async fn new_with_psk(dest: &str, psk: [u8; 32]) -> Result<Self> {
-        let _ = psk;
-        Self::new(dest).await
+    pub async fn new_with_psk(_dest: &str, _psk: [u8; 32]) -> Result<Self> {
+        bail!(
+            "PSK/socket-address constructors were removed; pass a configured QUIC Connection or Endpoint"
+        )
     }
 
     // Compatibility constructor while callers migrate away from PSK wiring.
     pub async fn new_with_psk_and_ticket(
-        dest: &str,
-        psk: [u8; 32],
+        _dest: &str,
+        _psk: [u8; 32],
         ticket: Option<SessionTicket>,
     ) -> Result<Self> {
-        let _ = psk;
-        Self::new_with_ticket(dest, ticket).await
+        let _ = ticket;
+        bail!(
+            "PSK/socket-address constructors were removed; pass a configured QUIC Connection or Endpoint"
+        )
     }
 
     // Compatibility constructor while callers migrate away from PSK wiring.
     pub async fn new_with_psk_and_config(
-        dest: &str,
-        psk: [u8; 32],
+        _dest: &str,
+        _psk: [u8; 32],
         config: TransportConfig,
     ) -> Result<Self> {
-        let _ = psk;
-        Self::new_with_config(dest, config).await
+        let _ = config;
+        bail!(
+            "PSK/socket-address constructors were removed; pass a configured QUIC Connection or Endpoint"
+        )
     }
 
     // Compatibility constructor while callers migrate away from PSK wiring.
     pub async fn new_with_psk_ticket_config_and_engine(
-        dest: &str,
-        psk: [u8; 32],
+        _dest: &str,
+        _psk: [u8; 32],
         ticket: Option<SessionTicket>,
         config: TransportConfig,
         handshake_engine: Arc<dyn HandshakeEngine>,
     ) -> Result<Self> {
-        let _ = psk;
-        Self::new_with_ticket_config_and_engine(dest, ticket, config, handshake_engine).await
+        let _ = (ticket, config, handshake_engine);
+        bail!(
+            "PSK/socket-address constructors were removed; pass a configured QUIC Connection or Endpoint"
+        )
     }
 
     pub fn set_transport_config(&mut self, config: TransportConfig) {
@@ -809,6 +885,125 @@ impl SankakuSender {
         Ok(())
     }
 
+    async fn start_control_tasks(&mut self) {
+        if self.control_out_tx.is_some() && self.control_in_rx.is_some() {
+            return;
+        }
+
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Bytes>();
+        let (in_tx, in_rx) = mpsc::unbounded_channel::<Bytes>();
+
+        let send_socket = Arc::clone(&self.socket);
+        tokio::spawn(async move {
+            while let Some(packet) = out_rx.recv().await {
+                if send_socket.send_control(packet).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let recv_socket = Arc::clone(&self.socket);
+        tokio::spawn(async move {
+            loop {
+                match recv_socket.recv_control().await {
+                    Ok(packet) => {
+                        if in_tx.send(packet).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        self.control_out_tx = Some(out_tx);
+        self.control_in_rx = Some(in_rx);
+    }
+
+    fn enqueue_control_packet(&self, packet: Vec<u8>) -> Result<()> {
+        let tx = self
+            .control_out_tx
+            .as_ref()
+            .context("control stream sender is not initialized")?;
+        tx.send(Bytes::from(packet))
+            .map_err(|_| anyhow::anyhow!("control stream sender task is not running"))?;
+        Ok(())
+    }
+
+    fn drain_control_channel(
+        &mut self,
+        session_id: u64,
+        stream_id: u32,
+        frame_index: u64,
+        redundancy: &mut f32,
+        jitter_us: &mut u32,
+    ) -> Result<()> {
+        let Some(rx) = self.control_in_rx.as_mut() else {
+            return Ok(());
+        };
+
+        loop {
+            match rx.try_recv() {
+                Ok(packet) if !packet.is_empty() => match PacketType::from_byte(packet[0]) {
+                    Some(PacketType::Feedback) => {
+                        if let Ok(feedback) = bincode::deserialize::<FeedbackPacket>(&packet[1..])
+                            && feedback.session_id == session_id
+                            && feedback.stream_id == stream_id
+                        {
+                            let next_bitrate =
+                                apply_aimd_bitrate(self.target_bitrate_bps, feedback.loss_ratio);
+                            if next_bitrate != self.target_bitrate_bps {
+                                self.target_bitrate_bps = next_bitrate;
+                                self.pending_bitrate_update_bps = Some(next_bitrate);
+                            }
+                        }
+                    }
+                    Some(PacketType::FecFeedback) => {
+                        if let Ok(feedback) =
+                            bincode::deserialize::<FecFeedbackPacket>(&packet[1..])
+                            && feedback.session_id == session_id
+                            && feedback.stream_id == stream_id
+                            && feedback.frame_index <= frame_index
+                        {
+                            *redundancy =
+                                adjust_redundancy(*redundancy, &feedback, self.transport.fec);
+                        }
+                    }
+                    Some(PacketType::Telemetry) => {
+                        if let Ok(telemetry) = bincode::deserialize::<TelemetryPacket>(&packet[1..])
+                            && telemetry.session_id == session_id
+                            && telemetry.stream_id == stream_id
+                            && telemetry.frame_index <= frame_index
+                        {
+                            *redundancy = adjust_redundancy_with_telemetry(
+                                *redundancy,
+                                &telemetry,
+                                self.transport.fec,
+                            );
+                            *jitter_us = telemetry.jitter_us;
+                        }
+                    }
+                    _ => {}
+                },
+                Ok(_) => {}
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+
+        Ok(())
+    }
+
+    fn target_packet_size(&self) -> usize {
+        let max_datagram = self
+            .socket
+            .max_datagram_size()
+            .unwrap_or(QUIC_DATAGRAM_FALLBACK_MAX);
+        max_datagram
+            .saturating_sub(DATA_PREFIX_SIZE)
+            .clamp(1, TARGET_PACKET_SIZE)
+    }
+
     /// Applies external RTCP-style telemetry (for example from app-managed feedback channels).
     pub fn apply_network_telemetry(
         &mut self,
@@ -860,13 +1055,15 @@ impl SankakuSender {
         if !is_supported_video_codec(frame.codec) {
             bail!("unsupported video codec id {}", frame.codec);
         }
-        let _ = self.streams.ensure_with(stream_id, StreamType::Video, || SenderStreamState {
-            next_frame_index: 0,
-            redundancy: self.transport.initial_redundancy.clamp(1.0, MAX_REDUNDANCY),
-            jitter_us: 0,
-            bytes_sent: 0,
-            frames_sent: 0,
-        })?;
+        let _ = self
+            .streams
+            .ensure_with(stream_id, StreamType::Video, || SenderStreamState {
+                next_frame_index: 0,
+                redundancy: self.transport.initial_redundancy.clamp(1.0, MAX_REDUNDANCY),
+                jitter_us: 0,
+                bytes_sent: 0,
+                frames_sent: 0,
+            })?;
 
         let frame_index = self
             .streams
@@ -884,13 +1081,9 @@ impl SankakuSender {
         let session_id = self
             .session_id
             .context("Sender missing session id after handshake")?;
-        let session_keys = self
-            .session_keys
-            .context("Sender missing session keys after handshake")?;
         let tx_context = TxPacketContext {
             session_id,
             stream_id,
-            header_key: session_keys.header_tx,
         };
 
         let (mut redundancy, mut jitter_us) = {
@@ -940,13 +1133,15 @@ impl SankakuSender {
         }
 
         self.ensure_handshake().await?;
-        let _ = self.streams.ensure_with(stream_id, StreamType::Audio, || SenderStreamState {
-            next_frame_index: 0,
-            redundancy: self.transport.initial_redundancy.clamp(1.0, MAX_REDUNDANCY),
-            jitter_us: 0,
-            bytes_sent: 0,
-            frames_sent: 0,
-        })?;
+        let _ = self
+            .streams
+            .ensure_with(stream_id, StreamType::Audio, || SenderStreamState {
+                next_frame_index: 0,
+                redundancy: self.transport.initial_redundancy.clamp(1.0, MAX_REDUNDANCY),
+                jitter_us: 0,
+                bytes_sent: 0,
+                frames_sent: 0,
+            })?;
         let session_id = self
             .session_id
             .context("Sender missing session id after handshake")?;
@@ -961,16 +1156,20 @@ impl SankakuSender {
         packet.extend_from_slice(&frames_per_packet.to_le_bytes());
         packet.extend_from_slice(&payload_len.to_le_bytes());
         packet.extend_from_slice(&payload);
-        self.socket.send(&packet).await?;
+        self.socket
+            .send_datagram(Bytes::from(packet))
+            .await
+            .map_err(|error| annotate_transport_error("failed to send audio datagram", error))?;
         Ok(())
     }
 
     pub async fn send_stream_fin(
-        &self,
+        &mut self,
         stream_id: u32,
         final_bytes: u64,
         final_frames: u64,
     ) -> Result<()> {
+        self.ensure_handshake().await?;
         let session_id = self
             .session_id
             .context("Sender missing session id after handshake")?;
@@ -982,127 +1181,46 @@ impl SankakuSender {
         };
         let mut packet = vec![TYPE_STREAM_FIN];
         packet.extend(bincode::serialize(&fin)?);
-        self.socket.send(&packet).await?;
+        self.enqueue_control_packet(packet)?;
+        if let Some(stats) = self.socket.quic_stats() {
+            let dropped = stats.path.lost_packets;
+            println!(
+                "QUIC_TELEMETRY: path.rtt={:?} udp_tx.dropped={}",
+                stats.path.rtt, dropped
+            );
+        }
         Ok(())
     }
 
     async fn ensure_handshake(&mut self) -> Result<()> {
-        if self.session_id.is_some() && self.session_keys.is_some() && self.pipeline.is_some() {
+        if self.session_id.is_some() && self.pipeline.is_some() {
             return Ok(());
         }
-        let (session_id, session_keys) = self.perform_handshake().await?;
+        self.start_control_tasks().await;
+        self.bootstrap_mode = SessionBootstrapMode::FullHandshake;
+        let session_id = self.session_id.unwrap_or_else(rand::random::<u64>);
         let mut pipeline =
-            SankakuPipeline::new_with_config(&session_keys.payload_tx, self.transport.pipeline);
+            SankakuPipeline::new_with_config(&TRANSPORT_PIPELINE_KEY, self.transport.pipeline);
         if !self.compression_graph.is_empty() {
             pipeline.update_compression_graph(&self.compression_graph)?;
         }
         self.pipeline = Some(pipeline);
         self.session_id = Some(session_id);
-        self.session_keys = Some(session_keys);
         Ok(())
     }
 
-    async fn perform_handshake(&mut self) -> Result<(u64, SessionKeys)> {
-        if let Some(ticket) = self.resumption_ticket.clone() {
-            match self.perform_resumption_0rtt(&ticket).await {
-                Ok(resumed) => {
-                    self.bootstrap_mode = SessionBootstrapMode::ZeroRttResume;
-                    return Ok(resumed);
-                }
-                Err(_) => {
-                    self.resumption_ticket = None;
-                }
-            }
-        }
-        self.bootstrap_mode = SessionBootstrapMode::FullHandshake;
-        self.perform_full_handshake().await
-    }
-
-    async fn perform_full_handshake(&mut self) -> Result<(u64, SessionKeys)> {
-        let my_keys = KeyExchange::new();
-        let my_public = *my_keys.public.as_bytes();
-        let session_id = rand::random::<u64>();
-
-        let hello = self
-            .handshake_engine
-            .build_client_hello(session_id, my_public);
-        let mut packet = vec![TYPE_HANDSHAKE];
-        packet.extend(bincode::serialize(&hello)?);
-
-        let mut buf = [0u8; 4096];
-        for _ in 0..HANDSHAKE_RETRIES {
-            self.socket.send(&packet).await?;
-
-            let recv = timeout(HANDSHAKE_TIMEOUT, self.socket.recv(&mut buf)).await;
-            let Ok(Ok(amt)) = recv else {
-                continue;
-            };
-            if amt <= 1 || buf[0] != TYPE_HANDSHAKE {
-                continue;
-            }
-
-            let Ok(server_hello) = bincode::deserialize::<HandshakePacket>(&buf[1..amt]) else {
-                continue;
-            };
-            if server_hello.session_id != session_id {
-                continue;
-            }
-            if server_hello.protocol_version != PROTOCOL_VERSION {
-                continue;
-            }
-            if !self
-                .handshake_engine
-                .verify_server_hello(&server_hello, my_public)
-            {
-                continue;
-            }
-
-            let shared_secret = my_keys.derive_shared_secret(server_hello.public_key);
-            let context = HandshakeContext {
-                protocol_version: server_hello.protocol_version,
-                capabilities: server_hello.capabilities,
-                cipher_suite: server_hello.cipher_suite,
-                session_id,
-                client_public: my_public,
-                server_public: server_hello.public_key,
-            };
-            let keys = self.handshake_engine.derive_session_keys(
-                shared_secret,
-                HandshakeRole::Client,
-                &context,
-            )?;
-
-            if let Some(ticket) = server_hello.session_ticket
-                && ticket.expires_at > unix_now_secs()
-            {
-                self.resumption_ticket = Some(ticket);
-            }
-            return Ok((session_id, keys));
-        }
-
-        bail!("Handshake timed out or authentication failed")
-    }
-
-    async fn perform_resumption_0rtt(&self, ticket: &SessionTicket) -> Result<(u64, SessionKeys)> {
-        if ticket.expires_at <= unix_now_secs() {
-            bail!("Resumption ticket is expired");
-        }
-
-        let session_id = rand::random::<u64>();
-        let resume = self
-            .handshake_engine
-            .build_resume_packet(session_id, ticket);
-        let mut packet = vec![TYPE_RESUME];
-        packet.extend(bincode::serialize(&resume)?);
-        self.socket.send(&packet).await?;
-
-        let keys = self.handshake_engine.derive_resumption_session_keys(
-            ticket.resumption_secret,
-            HandshakeRole::Client,
-            session_id,
-            resume.client_nonce,
-        )?;
-        Ok((session_id, keys))
+    fn prepare_protected_frame(
+        &mut self,
+        data: &[u8],
+        kind: VideoPayloadKind,
+        stream_id: u32,
+        frame_index: u64,
+    ) -> Result<Vec<u8>> {
+        // Pipeline transforms (OpenZL + payload framing) must execute before FEC chunking.
+        self.pipeline
+            .as_mut()
+            .context("Sender pipeline not initialized")?
+            .protect_frame(data, kind, stream_id, frame_index)
     }
 
     async fn send_chunk(
@@ -1116,11 +1234,7 @@ impl SankakuSender {
         redundancy: &mut f32,
         jitter_us: &mut u32,
     ) -> Result<()> {
-        let protected = self
-            .pipeline
-            .as_mut()
-            .context("Sender pipeline not initialized")?
-            .protect_frame(data, kind, context.stream_id, frame_index)?;
+        let protected = self.prepare_protected_frame(data, kind, context.stream_id, frame_index)?;
 
         let total_size =
             u32::try_from(protected.len()).context("Protected block exceeded u32 length")?;
@@ -1130,7 +1244,7 @@ impl SankakuSender {
             );
         }
 
-        let mut pkt_size = TARGET_PACKET_SIZE as u32;
+        let mut pkt_size = self.target_packet_size() as u32;
         if total_size <= pkt_size {
             pkt_size = total_size.div_ceil(2).max(1);
         }
@@ -1141,14 +1255,13 @@ impl SankakuSender {
         let total_packets = ((needed_packets as f32) * bounded_redundancy).ceil() as u32;
 
         for seq_id in 0..total_packets {
-            self.drain_control(
+            self.drain_control_channel(
                 context.session_id,
                 context.stream_id,
                 frame_index,
                 redundancy,
                 jitter_us,
-            )
-            .await?;
+            )?;
 
             let packet_data = encoder
                 .encode(seq_id)
@@ -1163,91 +1276,32 @@ impl SankakuSender {
             plain_header[22] = kind.as_header_flag();
             plain_header[23] = codec;
 
-            let mask = generate_header_mask(&context.header_key, &packet_data);
-            for index in 0..GEOMETRY_HEADER_SIZE {
-                plain_header[index] ^= mask[index];
-            }
-
             let mut wire_packet = Vec::with_capacity(DATA_PREFIX_SIZE + packet_data.len() + 64);
             wire_packet.push(TYPE_DATA);
             wire_packet.extend_from_slice(&context.session_id.to_le_bytes());
             wire_packet.extend_from_slice(&plain_header);
             wire_packet.extend_from_slice(&packet_data);
 
-            let target_len = target_packet_len(self.transport.padding, wire_packet.len());
+            let max_datagram = self
+                .socket
+                .max_datagram_size()
+                .unwrap_or(QUIC_DATAGRAM_FALLBACK_MAX);
+            let target_len =
+                target_packet_len(self.transport.padding, wire_packet.len()).min(max_datagram);
             if wire_packet.len() < target_len {
                 wire_packet.resize(target_len, 0u8);
             }
 
-            self.socket.send(&wire_packet).await?;
-            self.pacer
-                .pace(wire_packet.len(), keyframe, *jitter_us)
-                .await;
+            let wire_len = wire_packet.len();
+            self.socket
+                .send_datagram(Bytes::from(wire_packet))
+                .await
+                .map_err(|error| {
+                    annotate_transport_error("failed to send media datagram", error)
+                })?;
+            self.pacer.pace(wire_len, keyframe, *jitter_us).await;
         }
 
-        Ok(())
-    }
-
-    async fn drain_control(
-        &mut self,
-        session_id: u64,
-        stream_id: u32,
-        frame_index: u64,
-        redundancy: &mut f32,
-        jitter_us: &mut u32,
-    ) -> Result<()> {
-        let mut control_buf = [0u8; 512];
-        loop {
-            match self.socket.try_recv(&mut control_buf) {
-                Ok(amt) if amt >= 1 => match PacketType::from_byte(control_buf[0]) {
-                    Some(PacketType::Feedback) => {
-                        if let Ok(feedback) =
-                            bincode::deserialize::<FeedbackPacket>(&control_buf[1..amt])
-                            && feedback.session_id == session_id
-                            && feedback.stream_id == stream_id
-                        {
-                            let next_bitrate =
-                                apply_aimd_bitrate(self.target_bitrate_bps, feedback.loss_ratio);
-                            if next_bitrate != self.target_bitrate_bps {
-                                self.target_bitrate_bps = next_bitrate;
-                                self.pending_bitrate_update_bps = Some(next_bitrate);
-                            }
-                        }
-                    }
-                    Some(PacketType::FecFeedback) => {
-                        if let Ok(feedback) =
-                            bincode::deserialize::<FecFeedbackPacket>(&control_buf[1..amt])
-                            && feedback.session_id == session_id
-                            && feedback.stream_id == stream_id
-                            && feedback.frame_index <= frame_index
-                        {
-                            *redundancy =
-                                adjust_redundancy(*redundancy, &feedback, self.transport.fec);
-                        }
-                    }
-                    Some(PacketType::Telemetry) => {
-                        if let Ok(telemetry) =
-                            bincode::deserialize::<TelemetryPacket>(&control_buf[1..amt])
-                            && telemetry.session_id == session_id
-                            && telemetry.stream_id == stream_id
-                            && telemetry.frame_index <= frame_index
-                        {
-                            *redundancy = adjust_redundancy_with_telemetry(
-                                *redundancy,
-                                &telemetry,
-                                self.transport.fec,
-                            );
-                            *jitter_us = telemetry.jitter_us;
-                        }
-                    }
-                    Some(PacketType::Ack) => {}
-                    _ => {}
-                },
-                Ok(_) => break,
-                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
-                Err(error) => return Err(error.into()),
-            }
-        }
         Ok(())
     }
 }
@@ -1319,8 +1373,6 @@ struct StreamState {
 }
 
 struct SessionState {
-    source_ip: IpAddr,
-    keys: SessionKeys,
     pipeline: SankakuPipeline,
     streams: StreamRegistry<StreamState>,
 }
@@ -1331,21 +1383,25 @@ struct ReceiverRuntime {
 }
 
 pub struct SankakuReceiver {
-    socket: Box<dyn SrtTransport>,
-    ticket_key: [u8; 32],
+    socket: Arc<dyn SrtTransport>,
+    endpoint_guard: Option<Endpoint>,
     transport: TransportConfig,
-    handshake_engine: Arc<dyn HandshakeEngine>,
     compression_graph: Vec<u8>,
+    control_out_tx: Option<mpsc::UnboundedSender<Bytes>>,
+    control_in_rx: Option<mpsc::UnboundedReceiver<Bytes>>,
 }
 
 impl SankakuReceiver {
-    pub async fn new(bind_addr: &str) -> Result<Self> {
-        Self::new_with_ticket_key(bind_addr, random_ticket_key()).await
+    pub async fn new(handle: impl Into<QuicHandle>) -> Result<Self> {
+        Self::new_with_ticket_key(handle, random_ticket_key()).await
     }
 
-    pub async fn new_with_ticket_key(bind_addr: &str, ticket_key: [u8; 32]) -> Result<Self> {
+    pub async fn new_with_ticket_key(
+        handle: impl Into<QuicHandle>,
+        ticket_key: [u8; 32],
+    ) -> Result<Self> {
         Self::new_with_ticket_key_config_and_engine(
-            bind_addr,
+            handle,
             ticket_key,
             TransportConfig::default(),
             Arc::new(DefaultHandshakeEngine),
@@ -1354,12 +1410,12 @@ impl SankakuReceiver {
     }
 
     pub async fn new_with_ticket_key_and_config(
-        bind_addr: &str,
+        handle: impl Into<QuicHandle>,
         ticket_key: [u8; 32],
         config: TransportConfig,
     ) -> Result<Self> {
         Self::new_with_ticket_key_config_and_engine(
-            bind_addr,
+            handle,
             ticket_key,
             config,
             Arc::new(DefaultHandshakeEngine),
@@ -1368,75 +1424,87 @@ impl SankakuReceiver {
     }
 
     pub async fn new_with_ticket_key_config_and_engine(
-        bind_addr: &str,
+        handle: impl Into<QuicHandle>,
         ticket_key: [u8; 32],
         config: TransportConfig,
         handshake_engine: Arc<dyn HandshakeEngine>,
     ) -> Result<Self> {
         crate::init();
-        let socket = UdpSocket::bind(bind_addr).await?;
-        Self::new_with_transport_ticket_key_config_and_engine(
-            Box::new(UdpTransport::new(socket)),
-            ticket_key,
+        let _ = (ticket_key, handshake_engine);
+        let (connection, endpoint_guard) = resolve_quic_connection(handle).await?;
+        let socket: Box<dyn SrtTransport> = Box::new(QuicTransport::new(connection));
+        let mut receiver = Self::new_with_transport_ticket_key_config_and_engine(
+            socket,
+            [0u8; 32],
             config,
-            handshake_engine,
-        )
+            Arc::new(DefaultHandshakeEngine),
+        )?;
+        receiver.endpoint_guard = endpoint_guard;
+        Ok(receiver)
     }
 
     pub fn new_with_transport_ticket_key_config_and_engine(
         socket: Box<dyn SrtTransport>,
-        ticket_key: [u8; 32],
+        _ticket_key: [u8; 32],
         config: TransportConfig,
-        handshake_engine: Arc<dyn HandshakeEngine>,
+        _handshake_engine: Arc<dyn HandshakeEngine>,
     ) -> Result<Self> {
         crate::init();
+        let socket: Arc<dyn SrtTransport> = socket.into();
         Ok(Self {
             socket,
-            ticket_key,
+            endpoint_guard: None,
             transport: config,
-            handshake_engine,
             compression_graph: Vec::new(),
+            control_out_tx: None,
+            control_in_rx: None,
         })
     }
 
     // Compatibility constructor while callers migrate away from PSK wiring.
-    pub async fn new_with_psk(bind_addr: &str, psk: [u8; 32]) -> Result<Self> {
-        let _ = psk;
-        Self::new(bind_addr).await
+    pub async fn new_with_psk(_bind_addr: &str, _psk: [u8; 32]) -> Result<Self> {
+        bail!(
+            "PSK/socket-address constructors were removed; pass a configured QUIC Connection or Endpoint"
+        )
     }
 
     // Compatibility constructor while callers migrate away from PSK wiring.
     pub async fn new_with_psk_and_ticket_key(
-        bind_addr: &str,
-        psk: [u8; 32],
+        _bind_addr: &str,
+        _psk: [u8; 32],
         ticket_key: [u8; 32],
     ) -> Result<Self> {
-        let _ = psk;
-        Self::new_with_ticket_key(bind_addr, ticket_key).await
+        let _ = ticket_key;
+        bail!(
+            "PSK/socket-address constructors were removed; pass a configured QUIC Connection or Endpoint"
+        )
     }
 
     // Compatibility constructor while callers migrate away from PSK wiring.
     pub async fn new_with_psk_ticket_key_and_config(
-        bind_addr: &str,
-        psk: [u8; 32],
+        _bind_addr: &str,
+        _psk: [u8; 32],
         ticket_key: [u8; 32],
         config: TransportConfig,
     ) -> Result<Self> {
-        let _ = psk;
-        Self::new_with_ticket_key_and_config(bind_addr, ticket_key, config).await
+        let _ = (ticket_key, config);
+        bail!(
+            "PSK/socket-address constructors were removed; pass a configured QUIC Connection or Endpoint"
+        )
     }
 
     // Compatibility constructor while callers migrate away from PSK wiring.
     pub async fn new_with_psk_ticket_key_config_and_engine(
-        bind_addr: &str,
-        psk: [u8; 32],
+        _bind_addr: &str,
+        _psk: [u8; 32],
         ticket_key: [u8; 32],
         config: TransportConfig,
         handshake_engine: Arc<dyn HandshakeEngine>,
     ) -> Result<Self> {
-        let _ = psk;
-        Self::new_with_ticket_key_config_and_engine(bind_addr, ticket_key, config, handshake_engine)
-            .await
+        let _ = (ticket_key, config, handshake_engine);
+        bail!(
+            "PSK/socket-address constructors were removed; pass a configured QUIC Connection or Endpoint"
+        )
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr> {
@@ -1449,8 +1517,54 @@ impl SankakuReceiver {
         Ok(())
     }
 
-    fn build_receiver_pipeline(&self, payload_key: &[u8; 32]) -> Result<SankakuPipeline> {
-        let mut pipeline = SankakuPipeline::new_with_config(payload_key, self.transport.pipeline);
+    async fn start_control_tasks(&mut self) {
+        if self.control_out_tx.is_some() && self.control_in_rx.is_some() {
+            return;
+        }
+
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Bytes>();
+        let (in_tx, in_rx) = mpsc::unbounded_channel::<Bytes>();
+
+        let send_socket = Arc::clone(&self.socket);
+        tokio::spawn(async move {
+            while let Some(packet) = out_rx.recv().await {
+                if send_socket.send_control(packet).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let recv_socket = Arc::clone(&self.socket);
+        tokio::spawn(async move {
+            loop {
+                match recv_socket.recv_control().await {
+                    Ok(packet) => {
+                        if in_tx.send(packet).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        self.control_out_tx = Some(out_tx);
+        self.control_in_rx = Some(in_rx);
+    }
+
+    fn enqueue_control_packet(&self, packet: Vec<u8>) -> Result<()> {
+        let tx = self
+            .control_out_tx
+            .as_ref()
+            .context("receiver control stream sender is not initialized")?;
+        tx.send(Bytes::from(packet))
+            .map_err(|_| anyhow::anyhow!("receiver control stream sender task is not running"))?;
+        Ok(())
+    }
+
+    fn build_receiver_pipeline(&self) -> Result<SankakuPipeline> {
+        let mut pipeline =
+            SankakuPipeline::new_with_config(&TRANSPORT_PIPELINE_KEY, self.transport.pipeline);
         if !self.compression_graph.is_empty() {
             pipeline.update_compression_graph(&self.compression_graph)?;
         }
@@ -1501,44 +1615,60 @@ impl SankakuReceiver {
         self.run_media_loop(frame_tx, None).await
     }
 
+    fn max_datagram_payload(&self) -> usize {
+        self.socket
+            .max_datagram_size()
+            .unwrap_or(QUIC_DATAGRAM_FALLBACK_MAX)
+            .saturating_sub(DATA_PREFIX_SIZE)
+            .max(1)
+    }
+
     pub async fn run_media_loop(
-        self,
+        mut self,
         frame_tx: mpsc::Sender<InboundVideoFrame>,
         audio_tx: Option<mpsc::Sender<InboundAudioFrame>>,
     ) -> Result<()> {
+        self.start_control_tasks().await;
         let mut runtime = ReceiverRuntime::default();
-        let mut buf = vec![0u8; MAX_WIRE_PACKET_SIZE];
+        let mut control_rx = self
+            .control_in_rx
+            .take()
+            .context("receiver control stream was not initialized")?;
 
         loop {
-            let (amt, src) = self.socket.recv_from(&mut buf).await?;
-            if amt == 0 {
-                continue;
-            }
-            let packet = &buf[..amt];
-            match PacketType::from_byte(packet[0]) {
-                Some(PacketType::Handshake) => {
-                    self.handle_handshake_packet(&mut runtime, packet, src)
-                        .await?;
+            tokio::select! {
+                datagram = self.socket.recv_datagram() => {
+                    let packet = datagram
+                        .map_err(|error| annotate_transport_error("failed to receive media datagram", error))?;
+                    if packet.is_empty() {
+                        continue;
+                    }
+                    match PacketType::from_byte(packet[0]) {
+                        Some(PacketType::Ping) => {
+                            self.handle_ping_packet(&mut runtime, packet.as_ref()).await?;
+                        }
+                        Some(PacketType::Data) => {
+                            self.handle_data_packet(&mut runtime, packet.as_ref(), &frame_tx)
+                                .await?;
+                        }
+                        Some(PacketType::Audio) => {
+                            self.handle_audio_packet(&mut runtime, packet.as_ref(), audio_tx.as_ref())
+                                .await?;
+                        }
+                        _ => {}
+                    }
                 }
-                Some(PacketType::Resume) => {
-                    self.handle_resume_packet(&mut runtime, packet, src).await?;
+                control = control_rx.recv() => {
+                    let Some(packet) = control else {
+                        continue;
+                    };
+                    if packet.is_empty() {
+                        continue;
+                    }
+                    if matches!(PacketType::from_byte(packet[0]), Some(PacketType::StreamFin)) {
+                        self.handle_stream_fin_packet(&mut runtime, packet.as_ref()).await?;
+                    }
                 }
-                Some(PacketType::Ping) => {
-                    self.handle_ping_packet(&mut runtime, packet, src).await?;
-                }
-                Some(PacketType::StreamFin) => {
-                    self.handle_stream_fin_packet(&mut runtime, packet, src)
-                        .await?;
-                }
-                Some(PacketType::Data) => {
-                    self.handle_data_packet(&mut runtime, packet, src, &frame_tx)
-                        .await?;
-                }
-                Some(PacketType::Audio) => {
-                    self.handle_audio_packet(&mut runtime, packet, src, audio_tx.as_ref())
-                        .await?;
-                }
-                _ => {}
             }
         }
     }
@@ -1546,147 +1676,27 @@ impl SankakuReceiver {
     async fn handle_handshake_packet(
         &self,
         runtime: &mut ReceiverRuntime,
-        packet: &[u8],
-        src: SocketAddr,
-    ) -> Result<()> {
-        let Ok(client_hello) = bincode::deserialize::<HandshakePacket>(&packet[1..]) else {
-            return Ok(());
-        };
-        if !self.handshake_engine.verify_client_hello(&client_hello) {
-            return Ok(());
-        }
-
-        let server_keys = KeyExchange::new();
-        let server_public = *server_keys.public.as_bytes();
-        let session_ticket = self
-            .handshake_engine
-            .issue_session_ticket(&self.ticket_key, SESSION_TICKET_LIFETIME_SECS)
-            .ok();
-        let reply = self.handshake_engine.build_server_hello(
-            client_hello.session_id,
-            server_public,
-            client_hello.public_key,
-            session_ticket,
-        );
-
-        let mut response = vec![TYPE_HANDSHAKE];
-        response.extend(bincode::serialize(&reply)?);
-        self.socket.send_to(&response, src).await?;
-
-        let shared_secret = server_keys.derive_shared_secret(client_hello.public_key);
-        let context = HandshakeContext {
-            protocol_version: PROTOCOL_VERSION,
-            capabilities: client_hello.capabilities,
-            cipher_suite: client_hello.cipher_suite,
-            session_id: client_hello.session_id,
-            client_public: client_hello.public_key,
-            server_public,
-        };
-        let session_keys = self.handshake_engine.derive_session_keys(
-            shared_secret,
-            HandshakeRole::Server,
-            &context,
-        )?;
-        runtime.sessions.insert(
-            client_hello.session_id,
-            SessionState {
-                source_ip: src.ip(),
-                keys: session_keys,
-                pipeline: self.build_receiver_pipeline(&session_keys.payload_rx)?,
-                streams: StreamRegistry::default(),
-            },
-        );
-        Ok(())
-    }
-
-    async fn handle_resume_packet(
-        &self,
-        runtime: &mut ReceiverRuntime,
-        packet: &[u8],
-        src: SocketAddr,
-    ) -> Result<()> {
-        let Ok(resume) = bincode::deserialize::<ResumePacket>(&packet[1..]) else {
-            return Ok(());
-        };
-        if resume.protocol_version != PROTOCOL_VERSION {
-            return Ok(());
-        }
-
-        let now_secs = unix_now_secs();
-        let Some(validated_ticket) = self.handshake_engine.validate_ticket_identity(
-            &self.ticket_key,
-            &resume.ticket_identity,
-            now_secs,
-        ) else {
-            return Ok(());
-        };
-
-        if validated_ticket.expires_at != resume.expires_at
-            || !self.handshake_engine.verify_resume_packet(
-                &resume,
-                &validated_ticket.resumption_secret,
-                now_secs,
-            )
-        {
-            return Ok(());
-        }
-
-        self.accept_resumed_session(
-            runtime,
-            resume.session_id,
-            resume.client_nonce,
-            src,
-            validated_ticket,
-        )
-        .await
-    }
-
-    async fn accept_resumed_session(
-        &self,
-        runtime: &mut ReceiverRuntime,
         session_id: u64,
-        client_nonce: [u8; 24],
-        src: SocketAddr,
-        validated_ticket: ValidatedTicket,
     ) -> Result<()> {
-        let session_keys = self.handshake_engine.derive_resumption_session_keys(
-            validated_ticket.resumption_secret,
-            HandshakeRole::Server,
-            session_id,
-            client_nonce,
-        )?;
-
-        runtime.sessions.insert(
-            session_id,
-            SessionState {
-                source_ip: src.ip(),
-                keys: session_keys,
-                pipeline: self.build_receiver_pipeline(&session_keys.payload_rx)?,
-                streams: StreamRegistry::default(),
-            },
-        );
+        runtime.sessions.entry(session_id).or_insert(SessionState {
+            pipeline: self.build_receiver_pipeline()?,
+            streams: StreamRegistry::default(),
+        });
         Ok(())
     }
 
-    async fn handle_ping_packet(
-        &self,
-        runtime: &mut ReceiverRuntime,
-        packet: &[u8],
-        src: SocketAddr,
-    ) -> Result<()> {
+    async fn handle_ping_packet(&self, runtime: &mut ReceiverRuntime, packet: &[u8]) -> Result<()> {
         let Some(session_id) = packet.get(1..9).and_then(parse_u64_le) else {
             return Ok(());
         };
-        let Some(session) = runtime.sessions.get(&session_id) else {
-            return Ok(());
-        };
-        if session.source_ip != src.ip() {
-            return Ok(());
-        }
+        self.handle_handshake_packet(runtime, session_id).await?;
 
         let mut pong = vec![TYPE_PONG];
         pong.extend_from_slice(&session_id.to_le_bytes());
-        self.socket.send_to(&pong, src).await?;
+        self.socket
+            .send_datagram(Bytes::from(pong))
+            .await
+            .map_err(|error| annotate_transport_error("failed to send pong datagram", error))?;
         Ok(())
     }
 
@@ -1694,24 +1704,22 @@ impl SankakuReceiver {
         &self,
         runtime: &mut ReceiverRuntime,
         packet: &[u8],
-        src: SocketAddr,
     ) -> Result<()> {
         let Ok(fin) = bincode::deserialize::<StreamFinPacket>(&packet[1..]) else {
             return Ok(());
         };
+        self.handle_handshake_packet(runtime, fin.session_id)
+            .await?;
         let Some(session) = runtime.sessions.get_mut(&fin.session_id) else {
             return Ok(());
         };
-        if session.source_ip != src.ip() {
-            return Ok(());
-        }
 
         session.streams.remove(&fin.stream_id);
 
         let mut ack = vec![TYPE_ACK];
         ack.extend_from_slice(&fin.session_id.to_le_bytes());
         ack.extend_from_slice(&fin.stream_id.to_le_bytes());
-        self.socket.send_to(&ack, src).await?;
+        self.enqueue_control_packet(ack)?;
         Ok(())
     }
 
@@ -1719,7 +1727,6 @@ impl SankakuReceiver {
         &self,
         runtime: &mut ReceiverRuntime,
         packet: &[u8],
-        src: SocketAddr,
         audio_tx: Option<&mpsc::Sender<InboundAudioFrame>>,
     ) -> Result<()> {
         if packet.len() < AUDIO_PREFIX_SIZE {
@@ -1729,6 +1736,7 @@ impl SankakuReceiver {
         let Some(session_id) = packet.get(1..9).and_then(parse_u64_le) else {
             return Ok(());
         };
+        self.handle_handshake_packet(runtime, session_id).await?;
         let Some(stream_id) = packet.get(9..13).and_then(parse_u32_le) else {
             return Ok(());
         };
@@ -1761,9 +1769,6 @@ impl SankakuReceiver {
         let Some(session) = runtime.sessions.get_mut(&session_id) else {
             return Ok(());
         };
-        if session.source_ip != src.ip() {
-            return Ok(());
-        }
 
         let _ = session
             .streams
@@ -1788,7 +1793,6 @@ impl SankakuReceiver {
         &self,
         runtime: &mut ReceiverRuntime,
         packet: &[u8],
-        src: SocketAddr,
         frame_tx: &mpsc::Sender<InboundVideoFrame>,
     ) -> Result<()> {
         if packet.len() < DATA_PREFIX_SIZE {
@@ -1798,14 +1802,12 @@ impl SankakuReceiver {
         let Some(session_id) = packet.get(1..9).and_then(parse_u64_le) else {
             return Ok(());
         };
+        self.handle_handshake_packet(runtime, session_id).await?;
         let Some(session) = runtime.sessions.get_mut(&session_id) else {
             return Ok(());
         };
-        if session.source_ip != src.ip() {
-            return Ok(());
-        }
 
-        let Some(masked_header) = packet.get(9..DATA_PREFIX_SIZE) else {
+        let Some(wire_header) = packet.get(9..DATA_PREFIX_SIZE) else {
             return Ok(());
         };
         let Some(payload_with_padding) = packet.get(DATA_PREFIX_SIZE..) else {
@@ -1815,11 +1817,8 @@ impl SankakuReceiver {
             return Ok(());
         }
 
-        let mask = generate_header_mask(&session.keys.header_rx, payload_with_padding);
         let mut plain_header = [0u8; GEOMETRY_HEADER_SIZE];
-        for index in 0..GEOMETRY_HEADER_SIZE {
-            plain_header[index] = masked_header[index] ^ mask[index];
-        }
+        plain_header.copy_from_slice(wire_header);
 
         let stream_id = parse_header_u32(&plain_header, 0);
         let frame_index = parse_header_u64(&plain_header, 4);
@@ -1834,7 +1833,7 @@ impl SankakuReceiver {
         if total_size == 0 || total_size > MAX_PROTECTED_BLOCK_SIZE {
             return Ok(());
         }
-        if pkt_size == 0 || usize::from(pkt_size) > TARGET_PACKET_SIZE {
+        if pkt_size == 0 || usize::from(pkt_size) > self.max_datagram_payload() {
             return Ok(());
         }
         if VideoPayloadKind::from_header_flag(kind_flag).is_none() {
@@ -1850,9 +1849,10 @@ impl SankakuReceiver {
         }
         let payload = &payload_with_padding[..payload_len];
 
-        let stream = session
-            .streams
-            .ensure_with(stream_id, StreamType::Video, StreamState::default)?;
+        let stream =
+            session
+                .streams
+                .ensure_with(stream_id, StreamType::Video, StreamState::default)?;
         let arrival_now = Instant::now();
 
         stream
@@ -1867,7 +1867,7 @@ impl SankakuReceiver {
             };
             let mut feedback_wire = vec![TYPE_FEEDBACK];
             feedback_wire.extend(bincode::serialize(&feedback)?);
-            self.socket.send_to(&feedback_wire, src).await?;
+            self.enqueue_control_packet(feedback_wire)?;
         }
 
         if frame_index != stream.next_frame_index {
@@ -1967,7 +1967,7 @@ impl SankakuReceiver {
         };
         let mut feedback_wire = vec![TYPE_FEC_FEEDBACK];
         feedback_wire.extend(bincode::serialize(&feedback)?);
-        self.socket.send_to(&feedback_wire, src).await?;
+        self.enqueue_control_packet(feedback_wire)?;
 
         let packet_loss_ppm = if ideal_packets == 0 || used_packets <= ideal_packets {
             0
@@ -1984,7 +1984,7 @@ impl SankakuReceiver {
         };
         let mut telemetry_wire = vec![TYPE_TELEMETRY];
         telemetry_wire.extend(bincode::serialize(&telemetry)?);
-        self.socket.send_to(&telemetry_wire, src).await?;
+        self.enqueue_control_packet(telemetry_wire)?;
 
         Ok(())
     }
@@ -1992,8 +1992,8 @@ impl SankakuReceiver {
 
 /// Public high-level API for frontend clients.
 ///
-/// `SankakuStream` accepts a remote target and provides async send/receive
-/// methods over in-memory `VideoFrame` channels.
+/// `SankakuStream` accepts a configured QUIC connection and provides async
+/// send/receive methods over in-memory `VideoFrame` channels.
 pub struct SankakuStream {
     sender: SankakuSender,
     stream_id: u32,
@@ -2001,9 +2001,27 @@ pub struct SankakuStream {
 }
 
 impl SankakuStream {
-    pub async fn connect(target: &str, bind_addr: &str) -> Result<Self> {
-        let mut sender = SankakuSender::new(target).await?;
-        let receiver = SankakuReceiver::new(bind_addr).await?;
+    pub async fn connect(handle: impl Into<QuicHandle>) -> Result<Self> {
+        let (connection, endpoint_guard) = resolve_quic_connection(handle).await?;
+
+        let sender_socket: Box<dyn SrtTransport> = Box::new(QuicTransport::new(connection.clone()));
+        let mut sender = SankakuSender::new_with_connected_transport_config_and_engine(
+            sender_socket,
+            None,
+            TransportConfig::default(),
+            Arc::new(DefaultHandshakeEngine),
+        )?;
+        sender.endpoint_guard = endpoint_guard.clone();
+
+        let receiver_socket: Box<dyn SrtTransport> = Box::new(QuicTransport::new(connection));
+        let mut receiver = SankakuReceiver::new_with_transport_ticket_key_config_and_engine(
+            receiver_socket,
+            [0u8; 32],
+            TransportConfig::default(),
+            Arc::new(DefaultHandshakeEngine),
+        )?;
+        receiver.endpoint_guard = endpoint_guard;
+
         let inbound = receiver.spawn_frame_channel();
         let stream_id = sender.open_stream()?;
         Ok(Self {
@@ -2013,8 +2031,12 @@ impl SankakuStream {
         })
     }
 
-    pub async fn connect_with_env(target: &str, bind_addr: &str) -> Result<Self> {
-        Self::connect(target, bind_addr).await
+    pub async fn connect_with_endpoint(endpoint: Endpoint) -> Result<Self> {
+        Self::connect(endpoint).await
+    }
+
+    pub async fn connect_with_env(connection: Connection) -> Result<Self> {
+        Self::connect(connection).await
     }
 
     pub fn stream_id(&self) -> u32 {

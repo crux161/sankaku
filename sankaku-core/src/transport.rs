@@ -1,74 +1,123 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
+use quinn::Connection;
+use std::io::{Error, ErrorKind};
 use std::net::SocketAddr;
-use tokio::net::UdpSocket;
 
-const MAX_DATAGRAM_SIZE: usize = 65_507;
-
-/// Datagram transport abstraction for unreliable media/control exchange.
+/// Transport abstraction for Sankaku/RT media datagrams + reliable control signaling.
 ///
-/// The `send_datagram`/`recv_datagram` APIs provide a codec/socket-agnostic slot
-/// for future QUIC/WebRTC/Tailscale transports. Compatibility methods remain so
-/// existing UDP session code can migrate incrementally.
+/// `send_datagram`/`recv_datagram` carry MTU-limited media packets.
+/// `send_control`/`recv_control` carry reliable control packets.
+/// Compatibility methods remain so legacy call sites can migrate incrementally.
 #[async_trait]
 pub trait SrtTransport: Send + Sync {
     async fn send_datagram(&self, data: Bytes) -> Result<()>;
     async fn recv_datagram(&self) -> Result<Bytes>;
+    async fn send_control(&self, _data: Bytes) -> Result<()> {
+        Err(unsupported_socket_op("send_control").into())
+    }
+    async fn recv_control(&self) -> Result<Bytes> {
+        Err(unsupported_socket_op("recv_control").into())
+    }
+    fn max_datagram_size(&self) -> Option<usize> {
+        None
+    }
+    fn quic_stats(&self) -> Option<quinn::ConnectionStats> {
+        None
+    }
 
     async fn send(&self, buf: &[u8]) -> std::io::Result<usize>;
     async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize>;
-    async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize>;
-    async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)>;
+    async fn send_to(&self, _buf: &[u8], _target: SocketAddr) -> std::io::Result<usize> {
+        Err(unsupported_socket_op("send_to"))
+    }
+    async fn recv_from(&self, _buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        Err(unsupported_socket_op("recv_from"))
+    }
     fn try_recv(&self, buf: &mut [u8]) -> std::io::Result<usize>;
     fn local_addr(&self) -> std::io::Result<SocketAddr>;
 }
 
-pub struct UdpTransport {
-    socket: UdpSocket,
+fn unsupported_socket_op(op: &'static str) -> Error {
+    Error::new(
+        ErrorKind::Unsupported,
+        format!("{op} is unsupported for connection-oriented QUIC transports"),
+    )
 }
 
-impl UdpTransport {
-    pub fn new(socket: UdpSocket) -> Self {
-        Self { socket }
+fn io_other(err: impl std::fmt::Display) -> Error {
+    Error::other(err.to_string())
+}
+
+pub struct QuicTransport {
+    connection: Connection,
+}
+
+impl QuicTransport {
+    pub fn new(connection: Connection) -> Self {
+        Self { connection }
     }
 }
 
 #[async_trait]
-impl SrtTransport for UdpTransport {
+impl SrtTransport for QuicTransport {
     async fn send_datagram(&self, data: Bytes) -> Result<()> {
-        self.socket.send(&data).await?;
+        self.connection.send_datagram(data)?;
         Ok(())
     }
 
     async fn recv_datagram(&self) -> Result<Bytes> {
-        let mut buf = vec![0u8; MAX_DATAGRAM_SIZE];
-        let size = self.socket.recv(&mut buf).await?;
-        buf.truncate(size);
-        Ok(Bytes::from(buf))
+        Ok(self.connection.read_datagram().await?)
+    }
+
+    async fn send_control(&self, data: Bytes) -> Result<()> {
+        let (mut send, _recv) = self.connection.open_bi().await?;
+        let len = u32::try_from(data.len())
+            .map_err(|_| io_other("control payload too large for 32-bit stream frame"))?;
+        send.write_all(&len.to_le_bytes()).await.map_err(io_other)?;
+        send.write_all(&data).await.map_err(io_other)?;
+        send.finish().map_err(io_other)?;
+        Ok(())
+    }
+
+    async fn recv_control(&self) -> Result<Bytes> {
+        let (_send, mut recv) = self.connection.accept_bi().await?;
+        let mut len_buf = [0u8; 4];
+        recv.read_exact(&mut len_buf).await.map_err(io_other)?;
+        let len = u32::from_le_bytes(len_buf) as usize;
+        let mut payload = vec![0u8; len];
+        recv.read_exact(&mut payload).await.map_err(io_other)?;
+        Ok(Bytes::from(payload))
+    }
+
+    fn max_datagram_size(&self) -> Option<usize> {
+        self.connection.max_datagram_size()
+    }
+
+    fn quic_stats(&self) -> Option<quinn::ConnectionStats> {
+        Some(self.connection.stats())
     }
 
     async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
-        self.socket.send(buf).await
+        self.connection
+            .send_datagram(Bytes::copy_from_slice(buf))
+            .map_err(io_other)?;
+        Ok(buf.len())
     }
 
     async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.socket.recv(buf).await
+        let datagram = self.connection.read_datagram().await.map_err(io_other)?;
+        let copied = datagram.len().min(buf.len());
+        buf[..copied].copy_from_slice(&datagram[..copied]);
+        Ok(copied)
     }
 
-    async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
-        self.socket.send_to(buf, target).await
-    }
-
-    async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
-        self.socket.recv_from(buf).await
-    }
-
-    fn try_recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.socket.try_recv(buf)
+    fn try_recv(&self, _buf: &mut [u8]) -> std::io::Result<usize> {
+        Err(unsupported_socket_op("try_recv"))
     }
 
     fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.socket.local_addr()
+        Err(unsupported_socket_op("local_addr"))
     }
 }

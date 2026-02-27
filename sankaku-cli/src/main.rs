@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use sankaku_core::{
     extract_sao_parameters, nal_unit_type, parse_psk_hex, split_annex_b, SankakuReceiver,
-    SankakuSender, SaoParameters, VideoFrame, VideoPayloadKind,
+    SankakuSender, SaoParameters, VideoFrame, VideoPayloadKind, VIDEO_CODEC_HEVC,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -160,6 +160,7 @@ async fn main() -> Result<()> {
                 let frame = VideoFrame {
                     timestamp_us: unix_us_now(),
                     keyframe,
+                    codec: VIDEO_CODEC_HEVC,
                     kind: if sao {
                         VideoPayloadKind::SaoParameters
                     } else {
