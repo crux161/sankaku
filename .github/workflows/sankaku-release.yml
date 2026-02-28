@@ -59,6 +59,7 @@ jobs:
       # This prints the contents of the release folder to your GitHub logs
       # so you can see exactly what Cargo named your files.
       - name: Debug Target Directory
+        shell: bash
         run: ls -la target/${{ matrix.target }}/release/
 
       - name: Upload Artifact
