@@ -40,7 +40,8 @@ pub use webrtc::{
 use std::sync::OnceLock;
 
 /// Initialize global library state (Wirehair tables).
-pub fn init() {
+#[unsafe(no_mangle)]
+pub extern "C" fn init() {
     static WIREHAIR_INIT: OnceLock<()> = OnceLock::new();
     WIREHAIR_INIT.get_or_init(|| unsafe {
         let _ = sankaku_wirehair_sys::wirehair_init_(2);
