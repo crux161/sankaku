@@ -19,22 +19,22 @@ jobs:
           # Windows ARM64 (The missing link for your new frontend)
           - os: windows-latest
             target: aarch64-pc-windows-msvc
-            artifact_name: sankaku.dll
+            ext: dll
             
           # macOS Apple Silicon (For your local testing)
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact_name: libsankaku.dylib
+            ext: dylib
             
           # Windows x86_64 (Standard PC, good to have for broader testing)
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact_name: sankaku.dll
+            ext: dll
             
           # Linux ARM64 (Ready for those embedded hardware/custom ROM goals)
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            artifact_name: libsankaku.so
+            ext: so
 
     steps:
       - name: Checkout repository
@@ -56,10 +56,16 @@ jobs:
       - name: Build Sankaku Core
         run: cargo build --release --target ${{ matrix.target }}
 
+      # This prints the contents of the release folder to your GitHub logs
+      # so you can see exactly what Cargo named your files.
+      - name: Debug Target Directory
+        run: ls -la target/${{ matrix.target }}/release/
+
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: sankaku-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+          # The wildcard (*) ensures it grabs the library regardless of exact naming
+          path: target/${{ matrix.target }}/release/*.${{ matrix.ext }}
           if-no-files-found: error
           retention-days: 14
