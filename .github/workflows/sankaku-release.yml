@@ -1,0 +1,65 @@
+kaku.dylib
+            
+          # Windows x86_64 (Standard PC, good to have for broader testing)
+          #           - os: windows-latest
+          #                       target: x86_64-pc-windows-msvc
+          #                                   artifact_name: sankaku.dll
+          #                                               
+          #                                                         # Linux ARM64 (Ready for those embedded hardware/custom ROM goals)
+          #                                                                   - os: ubuntu-latest
+          #                                                                               target: aarch64-unknown-linux-gnu
+          #                                                                                           artifact_name: libsankaku.so
+          #
+          #                                                                                               steps:
+          #                                                                                                     - name: Checkout repository
+          #                                                                                                             uses: actions/checkout@v4
+          #
+          #                                                                                                                   - name: Install Rust toolchain
+          #                                                                                                                           run: |
+          #                                                                                                                                     rustup update stable
+          #                                                                                                                                               rustup target add ${{ matrix.target }}
+          #
+          #                                                                                                                                                     # Ubuntu needs a specific C-linker to cross-compile for Linux ARM64
+          #                                                                                                                                                           - name: Install Linux Cross-Compilation Tools
+          #                                                                                                                                                                   iname: Sankaku Release Builds
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  # This allows you to click a "Run workflow" button in the GitHub UI
+  workflow_dispatch: 
+
+jobs:
+  build-libraries:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false # If one build fails, keep building the others
+      matrix:
+        include:
+          # Windows ARM64 (The missing link for your new frontend)
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            artifact_name: sankaku.dll
+            
+          # macOS Apple Silicon (For your local testing)
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: libsanf: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+      - name: Build Sankaku Core
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sankaku-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+          if-no-files-found: error
+          retention-days: 14
