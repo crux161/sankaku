@@ -1995,6 +1995,7 @@ impl SankakuReceiver {
 /// `SankakuStream` accepts a configured QUIC connection and provides async
 /// send/receive methods over in-memory `VideoFrame` channels.
 pub struct SankakuStream {
+    connection: Connection,
     sender: SankakuSender,
     stream_id: u32,
     inbound: mpsc::Receiver<InboundVideoFrame>,
@@ -2003,6 +2004,7 @@ pub struct SankakuStream {
 impl SankakuStream {
     pub async fn connect(handle: impl Into<QuicHandle>) -> Result<Self> {
         let (connection, endpoint_guard) = resolve_quic_connection(handle).await?;
+        let stream_connection = connection.clone();
 
         let sender_socket: Box<dyn SrtTransport> = Box::new(QuicTransport::new(connection.clone()));
         let mut sender = SankakuSender::new_with_connected_transport_config_and_engine(
@@ -2025,6 +2027,7 @@ impl SankakuStream {
         let inbound = receiver.spawn_frame_channel();
         let stream_id = sender.open_stream()?;
         Ok(Self {
+            connection: stream_connection,
             sender,
             stream_id,
             inbound,
@@ -2069,6 +2072,18 @@ impl SankakuStream {
 
     pub async fn recv(&mut self) -> Option<InboundVideoFrame> {
         self.inbound.recv().await
+    }
+
+    pub fn try_recv(&mut self) -> Result<Option<InboundVideoFrame>> {
+        match self.inbound.try_recv() {
+            Ok(frame) => Ok(Some(frame)),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => bail!("inbound receiver disconnected"),
+        }
+    }
+
+    pub fn close(&self) {
+        self.connection.close(0u32.into(), b"sankaku ffi shutdown");
     }
 }
 

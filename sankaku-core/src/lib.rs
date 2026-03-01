@@ -1,4 +1,5 @@
 pub mod fec;
+pub mod ffi;
 pub mod handshake;
 pub mod hevc;
 pub mod metadata;
@@ -10,6 +11,13 @@ pub mod transport;
 pub mod webrtc;
 
 pub use fec::{FecError, WirehairDecoder, WirehairEncoder};
+pub use ffi::{
+    SANKAKU_FRAME_FLAG_KEYFRAME, SANKAKU_STATUS_BUFFER_OVERFLOW, SANKAKU_STATUS_DISCONNECTED,
+    SANKAKU_STATUS_INTERNAL, SANKAKU_STATUS_INVALID_ARGUMENT, SANKAKU_STATUS_INVALID_HANDLE,
+    SANKAKU_STATUS_OK, SANKAKU_STATUS_PANIC, SANKAKU_STATUS_WOULD_BLOCK,
+    SankakuFrameKind, SankakuInboundFrame, SankakuQuicHandle, SankakuQuicHandleKind,
+    SankakuStreamHandle, SankakuVideoFrame,
+};
 pub use handshake::{
     CIPHER_SUITE_DEFAULT, DefaultHandshakeEngine, HandshakeContext, HandshakeEngine,
     HandshakePacket, HandshakeRole, KeyExchange, PROTOCOL_BASELINE_CAPS, PROTOCOL_CAP_RESUMPTION,

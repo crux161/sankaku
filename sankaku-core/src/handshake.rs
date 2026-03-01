@@ -889,9 +889,9 @@ impl HandshakeEngine for DefaultHandshakeEngine {
 #[cfg(test)]
 mod tests {
     use super::{
-        HandshakeContext, HandshakePacket, HandshakeRole, PROTOCOL_BASELINE_CAPS, PROTOCOL_VERSION,
-        ResumePacket, derive_resumption_session_keys, derive_session_keys, issue_session_ticket,
-        validate_ticket_identity,
+        CIPHER_SUITE_DEFAULT, HandshakeContext, HandshakePacket, HandshakeRole,
+        PROTOCOL_BASELINE_CAPS, PROTOCOL_VERSION, ResumePacket, derive_resumption_session_keys,
+        derive_session_keys, issue_session_ticket, validate_ticket_identity,
     };
 
     #[test]
