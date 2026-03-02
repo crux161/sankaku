@@ -18,14 +18,22 @@ fn main() {
     println!("cargo:rerun-if-changed=wirehair/wirehair.h");
 
     // 3. Compile the C++ library
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let is_msvc = target.contains("msvc");
+
     let mut build = cc::Build::new();
+    build.cpp(true).include(".");
+
+    if is_msvc {
+        build.std("c++14");
+    } else {
+        build.std("c++11");
+        build.flag("-O3");
+    }
+
     build
-        .cpp(true)
-        .std("c++11")
-        .flag("-O3")
         .flag_if_supported("-mavx2")
         .flag_if_supported("-mssse3")
-        .include(".")
         .files(cpp_sources)
         .compile("wirehair");
 

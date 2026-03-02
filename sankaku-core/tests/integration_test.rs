@@ -1,4 +1,4 @@
-use sankaku_core::{
+use sankaku::{
     InboundVideoFrame, SankakuReceiver, SankakuSender, SankakuStream, SessionBootstrapMode,
     VideoFrame, VideoPayloadKind, init,
 };

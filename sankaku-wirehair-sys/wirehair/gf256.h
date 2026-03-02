@@ -54,14 +54,16 @@
 // Platform/Architecture
 
 #if defined(__ARM_ARCH) || defined(__ARM_NEON) || defined(__ARM_NEON__)
-    #if !defined(IOS) && !defined(__APPLE__)
+    #if !defined(IOS) && !defined(__APPLE__) && !defined(_WIN32)
         #define LINUX_ARM
     #endif
 #endif
 
-#if defined(ANDROID) || defined(IOS) || defined(LINUX_ARM) || defined(__powerpc__) || defined(__s390__) || (defined(__APPLE__) && defined(__aarch64__))
+#if defined(ANDROID) || defined(IOS) || defined(LINUX_ARM) || defined(__powerpc__) || defined(__s390__) \
+    || (defined(__APPLE__) && defined(__aarch64__)) \
+    || (defined(_WIN32) && (defined(_M_ARM64) || defined(_M_ARM)))
     #define GF256_TARGET_MOBILE
-#endif // ANDROID
+#endif
 
 #if defined(__AVX2__) && (!defined (_MSC_VER) || _MSC_VER >= 1900)
     #define GF256_TRY_AVX2 /* 256-bit */

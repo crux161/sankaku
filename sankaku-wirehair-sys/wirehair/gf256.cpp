@@ -52,7 +52,7 @@
 // This comes from linux-raid (https://www.spinics.net/lists/raid/msg58403.html)
 //
 #ifdef GF256_TRY_NEON
-#if __ARM_ARCH <= 7 && !defined(__aarch64__)
+#if __ARM_ARCH <= 7 && !defined(__aarch64__) && !defined(_M_ARM64)
 static GF256_FORCE_INLINE uint8x16_t vqtbl1q_u8(uint8x16_t a, uint8x16_t b)
 {
     union {
@@ -204,8 +204,8 @@ static bool gf256_self_test()
 // Requires iPhone 5S or newer
 static const bool CpuHasNeon = true;
 static const bool CpuHasNeon64 = true;
-# else // ANDROID or LINUX_ARM
-#  if defined(__aarch64__)
+# else // ANDROID, LINUX_ARM, or Windows ARM64
+#  if defined(__aarch64__) || defined(_M_ARM64)
 static bool CpuHasNeon = true;      // if AARCH64, then we have NEON for sure...
 static bool CpuHasNeon64 = true;    // And we have ASIMD
 #  else

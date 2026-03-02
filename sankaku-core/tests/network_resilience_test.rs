@@ -1,4 +1,4 @@
-use sankaku_core::{
+use sankaku::{
     InboundVideoFrame, SankakuReceiver, SankakuSender, VideoFrame, VideoPayloadKind, init,
 };
 use std::time::Duration;

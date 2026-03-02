@@ -150,14 +150,49 @@ void sankaku_frame_free(SankakuInboundFrame* frame);
 
 ## Compiled Artifacts
 
-For integration and linking, Kagami should use the packaged Windows outputs at the following paths:
+Sankaku-core produces a dynamic library (`cdylib`) and a Rust-linkable static lib (`rlib`) for each supported target.
+
+### Build Command
+
+```bash
+cargo build -p sankaku-core --lib --release
+```
+
+### Per-Platform Outputs
+
+| Platform | Cargo Target | Dynamic Library | Import/Link Library |
+|---|---|---|---|
+| Windows x86-64 | `x86_64-pc-windows-msvc` | `sankaku.dll` | `sankaku.dll.lib` |
+| Windows ARM64 | `aarch64-pc-windows-msvc` | `sankaku.dll` | `sankaku.dll.lib` |
+| macOS (Universal) | `aarch64-apple-darwin` / `x86_64-apple-darwin` | `libsankaku.dylib` | (embedded) |
+| Linux x86-64 | `x86_64-unknown-linux-gnu` | `libsankaku.so` | (embedded) |
+| Linux ARM64 | `aarch64-unknown-linux-gnu` | `libsankaku.so` | (embedded) |
+| iOS (device) | `aarch64-apple-ios` | `libsankaku.dylib` | (embedded) |
+
+For cross-compilation, supply `--target <triple>`:
+
+```bash
+cargo build -p sankaku-core --lib --release --target aarch64-pc-windows-msvc
+```
+
+A macOS universal binary can be produced with `lipo` after building both `aarch64-apple-darwin` and `x86_64-apple-darwin`.
+
+### C Header
+
+The public C header is located at `sankaku-core/include/sankaku.h`. On Windows, the `SANKAKU_API` macro resolves to `__declspec(dllexport)` when building the DLL and `__declspec(dllimport)` when consuming it. Consumers must **not** define `SANKAKU_BUILD_DLL`.
+
+### Linking on Windows
+
+Link against the generated import library (`sankaku.dll.lib`) and ensure `sankaku.dll` is available at runtime. For Kagami, the expected layout remains:
 
 - `core/sankaku/sankaku.dll`
 - `core/sankaku/sankaku.dll.lib`
 - `core/nezumi/nezumi.dll`
 - `core/nezumi/nezumi.dll.lib`
 
-These are the expected runtime and import-library artifacts for MSVC/Windows integration.
+### Linking on macOS / Linux / iOS
+
+Link against `libsankaku.dylib` (macOS/iOS) or `libsankaku.so` (Linux) using standard `-lsankaku` / `-L<path>` linker flags.
 
 ## Memory Contract
 
