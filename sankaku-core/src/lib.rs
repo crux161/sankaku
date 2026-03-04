@@ -1,3 +1,4 @@
+pub mod call_ffi;
 pub mod fec;
 pub mod ffi;
 pub mod handshake;
@@ -10,13 +11,19 @@ pub mod transport;
 #[cfg(feature = "webrtc")]
 pub mod webrtc;
 
+pub use call_ffi::{
+    SANKAKU_CALL_DIAL_FLAG_ALLOW_INSECURE_ADDR_ONLY, SANKAKU_CALL_IDENTITY_LEN,
+    SANKAKU_STATUS_BUFFER_TOO_SMALL, SANKAKU_STATUS_INVALID_STATE, SANKAKU_STATUS_REJECTED,
+    SANKAKU_STATUS_UNSUPPORTED, SankakuCallDialParams, SankakuCallEndpointConfig,
+    SankakuCallEndpointHandle, SankakuCallEvent, SankakuCallEventKind, SankakuCallHandle,
+};
 pub use fec::{FecError, WirehairDecoder, WirehairEncoder};
 pub use ffi::{
     SANKAKU_FRAME_FLAG_KEYFRAME, SANKAKU_STATUS_BUFFER_OVERFLOW, SANKAKU_STATUS_DISCONNECTED,
     SANKAKU_STATUS_INTERNAL, SANKAKU_STATUS_INVALID_ARGUMENT, SANKAKU_STATUS_INVALID_HANDLE,
-    SANKAKU_STATUS_OK, SANKAKU_STATUS_PANIC, SANKAKU_STATUS_WOULD_BLOCK,
-    SankakuFrameKind, SankakuInboundFrame, SankakuQuicHandle, SankakuQuicHandleKind,
-    SankakuStreamHandle, SankakuVideoFrame,
+    SANKAKU_STATUS_OK, SANKAKU_STATUS_PANIC, SANKAKU_STATUS_WOULD_BLOCK, SankakuFrameKind,
+    SankakuInboundFrame, SankakuQuicHandle, SankakuQuicHandleKind, SankakuStreamHandle,
+    SankakuVideoFrame,
 };
 pub use handshake::{
     CIPHER_SUITE_DEFAULT, DefaultHandshakeEngine, HandshakeContext, HandshakeEngine,
