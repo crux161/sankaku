@@ -1,5 +1,7 @@
+#[cfg(not(target_arch = "wasm32"))]
 pub mod call_ffi;
 pub mod fec;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod ffi;
 pub mod handshake;
 pub mod hevc;
@@ -7,10 +9,14 @@ pub mod metadata;
 pub mod openzl;
 pub mod pipeline;
 pub mod session;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod transport;
+#[cfg(target_arch = "wasm32")]
+pub mod wasm_bridge;
 #[cfg(feature = "webrtc")]
 pub mod webrtc;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub use call_ffi::{
     SANKAKU_CALL_DIAL_FLAG_ALLOW_INSECURE_ADDR_ONLY, SANKAKU_CALL_IDENTITY_LEN,
     SANKAKU_STATUS_BUFFER_TOO_SMALL, SANKAKU_STATUS_INVALID_STATE, SANKAKU_STATUS_REJECTED,
@@ -18,6 +24,7 @@ pub use call_ffi::{
     SankakuCallEndpointHandle, SankakuCallEvent, SankakuCallEventKind, SankakuCallHandle,
 };
 pub use fec::{FecError, WirehairDecoder, WirehairEncoder};
+#[cfg(not(target_arch = "wasm32"))]
 pub use ffi::{
     SANKAKU_FRAME_FLAG_KEYFRAME, SANKAKU_STATUS_BUFFER_OVERFLOW, SANKAKU_STATUS_DISCONNECTED,
     SANKAKU_STATUS_INTERNAL, SANKAKU_STATUS_INVALID_ARGUMENT, SANKAKU_STATUS_INVALID_HANDLE,
@@ -45,6 +52,7 @@ pub use session::{
     QuicHandle, SankakuReceiver, SankakuSender, SankakuStream, SessionBootstrapMode, StreamContext,
     StreamType, TransportConfig, VIDEO_CODEC_H264, VIDEO_CODEC_HEVC, VideoFrame, parse_psk_hex,
 };
+#[cfg(not(target_arch = "wasm32"))]
 pub use transport::{QuicTransport, SrtTransport};
 #[cfg(feature = "webrtc")]
 pub use webrtc::{
@@ -55,6 +63,7 @@ pub use webrtc::{
 use std::sync::OnceLock;
 
 /// Initialize global library state (Wirehair tables).
+#[cfg(not(target_arch = "wasm32"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn init() {
     static WIREHAIR_INIT: OnceLock<()> = OnceLock::new();
