@@ -1,5 +1,11 @@
 use wasm_bindgen::prelude::*;
 
+macro_rules! println {
+    ($($arg:tt)*) => {{
+        web_sys::console::log_1(&JsValue::from_str(&format!($($arg)*)));
+    }};
+}
+
 #[wasm_bindgen]
 pub struct SankakuWebCore;
 
@@ -7,6 +13,7 @@ pub struct SankakuWebCore;
 impl SankakuWebCore {
     #[wasm_bindgen(constructor)]
     pub fn new() -> SankakuWebCore {
+        println!("SankakuWebCore initialized");
         SankakuWebCore
     }
 

@@ -4,10 +4,13 @@ pub mod fec;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod ffi;
 pub mod handshake;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod hevc;
 pub mod metadata;
 pub mod openzl;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod pipeline;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod session;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod transport;
@@ -38,14 +41,17 @@ pub use handshake::{
     PROTOCOL_VERSION, ResumePacket, SessionKeys, SessionTicket, ValidatedTicket,
     derive_resumption_session_keys, issue_session_ticket, validate_ticket_identity,
 };
+#[cfg(not(target_arch = "wasm32"))]
 pub use hevc::{
     AnnexBNalIter, SaoParameters, annex_b_nal_units, extract_sao_parameters, nal_unit_type,
     split_annex_b,
 };
 pub use metadata::{SessionManifest, StreamSemantics};
+#[cfg(not(target_arch = "wasm32"))]
 pub use pipeline::{
     CompressionMode, KyuPipeline, PipelineConfig, SankakuPipeline, VideoPayloadKind,
 };
+#[cfg(not(target_arch = "wasm32"))]
 pub use session::{
     AUDIO_CODEC_DEBUG_TEXT, AUDIO_CODEC_OPUS, FecPolicy, InboundAudioFrame, InboundFrame,
     InboundVideoFrame, KyuErrorCode, KyuEvent, KyuReceiver, KyuSender, MediaFrame, PaddingMode,
